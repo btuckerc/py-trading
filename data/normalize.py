@@ -1,16 +1,25 @@
 """Data normalization and point-in-time table construction."""
 
 import pandas as pd
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from datetime import datetime
 from .storage import StorageBackend
+from loguru import logger
 
 
 class DataNormalizer:
     """Normalizes vendor data into canonical schemas."""
     
-    def __init__(self, storage: StorageBackend):
+    def __init__(self, storage: StorageBackend, vendor_client=None):
+        """
+        Initialize normalizer.
+        
+        Args:
+            storage: Storage backend for database access
+            vendor_client: Optional vendor client for fetching asset metadata (sector, industry)
+        """
         self.storage = storage
+        self.vendor_client = vendor_client
         self.symbol_to_asset_id: Dict[str, int] = {}
         self._load_asset_mapping()
     
@@ -24,8 +33,34 @@ class DataNormalizer:
             # Table might not exist yet
             pass
     
+    def _fetch_asset_metadata(self, symbol: str) -> Dict:
+        """
+        Fetch asset metadata (sector, industry, etc.) from vendor.
+        
+        Returns dict with sector, industry, exchange, currency, name fields.
+        """
+        if self.vendor_client is None:
+            return {'sector': None, 'industry': None, 'exchange': None, 'currency': 'USD', 'name': None}
+        
+        try:
+            if hasattr(self.vendor_client, 'fetch_asset_info'):
+                info_df = self.vendor_client.fetch_asset_info([symbol])
+                if len(info_df) > 0:
+                    row = info_df.iloc[0]
+                    return {
+                        'sector': row.get('sector'),
+                        'industry': row.get('industry'),
+                        'exchange': row.get('exchange'),
+                        'currency': row.get('currency', 'USD'),
+                        'name': row.get('name'),
+                    }
+        except Exception as e:
+            logger.warning(f"Could not fetch metadata for {symbol}: {e}")
+        
+        return {'sector': None, 'industry': None, 'exchange': None, 'currency': 'USD', 'name': None}
+    
     def _get_or_create_asset_id(self, symbol: str, exchange: Optional[str] = None) -> int:
-        """Get or create asset_id for a symbol."""
+        """Get or create asset_id for a symbol, automatically fetching sector/industry."""
         if symbol in self.symbol_to_asset_id:
             return self.symbol_to_asset_id[symbol]
         
@@ -33,18 +68,71 @@ class DataNormalizer:
         max_id = max(self.symbol_to_asset_id.values()) if self.symbol_to_asset_id else 0
         asset_id = max_id + 1
         
+        # Fetch metadata from vendor (sector, industry, etc.)
+        metadata = self._fetch_asset_metadata(symbol)
+        
         # Insert into assets table
         asset_df = pd.DataFrame([{
             'asset_id': asset_id,
             'symbol': symbol,
-            'exchange': exchange or 'NYSE',
-            'currency': 'USD',
+            'exchange': exchange or metadata.get('exchange') or 'NYSE',
+            'currency': metadata.get('currency', 'USD'),
+            'first_trade_date': None,
+            'last_trade_date': None,
+            'sector': metadata.get('sector'),
+            'industry': metadata.get('industry'),
             'is_active': True
         }])
         self.storage.insert_dataframe('assets', asset_df)
         
+        logger.info(f"Created asset {symbol} (id={asset_id}): sector={metadata.get('sector')}, industry={metadata.get('industry')}")
+        
         self.symbol_to_asset_id[symbol] = asset_id
         return asset_id
+    
+    def update_asset_metadata(self, symbols: Optional[List[str]] = None):
+        """
+        Update sector/industry metadata for existing assets.
+        
+        Args:
+            symbols: List of symbols to update. If None, updates all assets with missing sector data.
+        """
+        if self.vendor_client is None:
+            logger.warning("No vendor client configured, cannot update asset metadata")
+            return
+        
+        # Get assets to update
+        if symbols is None:
+            # Get all assets with missing sector data
+            assets_df = self.storage.query(
+                "SELECT asset_id, symbol FROM assets WHERE sector IS NULL OR sector = ''"
+            )
+            symbols = assets_df['symbol'].tolist() if len(assets_df) > 0 else []
+        
+        if len(symbols) == 0:
+            logger.info("No assets need metadata update")
+            return
+        
+        logger.info(f"Updating metadata for {len(symbols)} assets...")
+        
+        # Fetch metadata in batch
+        if hasattr(self.vendor_client, 'fetch_asset_info'):
+            info_df = self.vendor_client.fetch_asset_info(symbols)
+            
+            for _, row in info_df.iterrows():
+                symbol = row['symbol']
+                sector = row.get('sector')
+                industry = row.get('industry')
+                
+                if sector is not None:
+                    self.storage.conn.execute(f"""
+                        UPDATE assets 
+                        SET sector = '{sector}', industry = '{industry if industry else ""}'
+                        WHERE symbol = '{symbol}'
+                    """)
+                    logger.debug(f"Updated {symbol}: sector={sector}, industry={industry}")
+        
+        logger.info(f"Metadata update complete for {len(symbols)} assets")
     
     def normalize_bars(
         self,

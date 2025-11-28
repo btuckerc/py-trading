@@ -2,9 +2,9 @@
 
 import pandas as pd
 import numpy as np
-from typing import List, Optional, Set, Dict
-import pandas as pd
+from typing import List, Optional, Set, Dict, Tuple
 from datetime import date
+from loguru import logger
 from data.asof_api import AsOfQueryAPI
 from data.clock import SimulationClock
 from features.technical import TechnicalFeatureBuilder
@@ -16,6 +16,161 @@ from features.options import OptionsFeatureBuilder
 from features.microstructure import MicrostructureFeatureBuilder
 from features.scaling import ScalerManager, FeatureScaler
 from configs.loader import get_config
+
+
+class RegimeFeatureBuilder:
+    """
+    Builds regime features from pre-computed regime labels.
+    
+    Features include:
+    - regime_id: Numeric cluster ID
+    - One-hot encoded regime descriptors
+    - Raw regime indicators (vol, drawdown) for VIX-style sizing
+    """
+    
+    def __init__(self, api: AsOfQueryAPI, include_raw_features: bool = True):
+        self.api = api
+        self.include_raw_features = include_raw_features
+    
+    def build_features(self, as_of_date: date, universe: Optional[Set[int]] = None) -> pd.DataFrame:
+        """
+        Build regime features for all assets on a date.
+        
+        Queries the regimes table for the current regime and returns it as a feature
+        for each asset in the universe.
+        
+        Returns:
+            DataFrame with columns: asset_id, regime_id, regime_bull_low_vol, etc.
+        """
+        try:
+            # Query the regimes table for this date
+            result = self.api.storage.conn.execute("""
+                SELECT date, regime_id, regime_descriptor
+                FROM regimes
+                WHERE date = ?
+            """, [as_of_date]).df()
+            
+            if len(result) == 0:
+                # No regime for this date, try to find most recent
+                result = self.api.storage.conn.execute("""
+                    SELECT date, regime_id, regime_descriptor
+                    FROM regimes
+                    WHERE date <= ?
+                    ORDER BY date DESC
+                    LIMIT 1
+                """, [as_of_date]).df()
+                
+                if len(result) == 0:
+                    return pd.DataFrame(columns=['asset_id'])
+            
+            regime_id = result['regime_id'].iloc[0]
+            regime_descriptor = result['regime_descriptor'].iloc[0]
+            
+            # Create features for each asset
+            if universe is None:
+                universe = self.api.get_universe_at_date(as_of_date)
+            
+            # Get raw regime features if enabled (for VIX-style sizing)
+            raw_features = {}
+            if self.include_raw_features:
+                raw_features = self._get_raw_regime_features(as_of_date)
+            
+            records = []
+            for asset_id in universe:
+                record = {
+                    'asset_id': asset_id,
+                    'regime_id': regime_id,
+                    # One-hot encode regime descriptors
+                    'regime_bull_low_vol': 1 if regime_descriptor == 'bull_low_vol' else 0,
+                    'regime_bull_high_vol': 1 if regime_descriptor == 'bull_high_vol' else 0,
+                    'regime_bear_low_vol': 1 if regime_descriptor == 'bear_low_vol' else 0,
+                    'regime_bear_high_vol': 1 if regime_descriptor == 'bear_high_vol' else 0,
+                }
+                
+                # Add raw features (same for all assets - market-level)
+                if raw_features:
+                    record['market_realized_vol_20d'] = raw_features.get('realized_vol_20d', 0.15)
+                    record['market_drawdown'] = raw_features.get('drawdown', 0.0)
+                    record['market_vol_of_vol'] = raw_features.get('vol_of_vol', 0.0)
+                
+                records.append(record)
+            
+            return pd.DataFrame(records)
+        except Exception as e:
+            # Table may not exist or other error
+            logger.debug(f"RegimeFeatureBuilder error: {e}")
+            return pd.DataFrame(columns=['asset_id'])
+    
+    def _get_raw_regime_features(self, as_of_date: date) -> Dict:
+        """Get raw market-level regime features for VIX-style sizing."""
+        try:
+            # Get SPY bars for volatility calculation
+            benchmark_df = self.api.storage.query("SELECT asset_id FROM assets WHERE symbol = 'SPY'")
+            if len(benchmark_df) == 0:
+                return {}
+            
+            benchmark_asset_id = benchmark_df['asset_id'].iloc[0]
+            
+            # Get recent bars
+            bars_df = self.api.get_bars_asof(as_of_date, lookback_days=60, universe={benchmark_asset_id})
+            if len(bars_df) == 0:
+                return {}
+            
+            bars_df = bars_df.sort_values('date')
+            prices = bars_df['adj_close'].values
+            
+            if len(prices) < 21:
+                return {}
+            
+            # Calculate features
+            returns = np.log(prices[1:] / prices[:-1])
+            
+            # Realized vol (annualized)
+            realized_vol_20d = np.std(returns[-20:]) * np.sqrt(252)
+            
+            # Drawdown
+            rolling_max = np.maximum.accumulate(prices)
+            drawdowns = (prices - rolling_max) / rolling_max
+            current_drawdown = drawdowns[-1]
+            
+            # Vol of vol
+            if len(returns) >= 40:
+                rolling_vols = pd.Series(returns).rolling(20).std().dropna().values * np.sqrt(252)
+                vol_of_vol = np.std(rolling_vols) if len(rolling_vols) > 1 else 0.0
+            else:
+                vol_of_vol = 0.0
+            
+            return {
+                'realized_vol_20d': float(realized_vol_20d),
+                'drawdown': float(current_drawdown),
+                'vol_of_vol': float(vol_of_vol),
+            }
+        except Exception as e:
+            logger.debug(f"Error getting raw regime features: {e}")
+            return {}
+    
+    def get_current_regime(self, as_of_date: date) -> Tuple[int, str]:
+        """
+        Get the current regime ID and descriptor for a date.
+        
+        Returns:
+            Tuple of (regime_id, regime_descriptor)
+        """
+        try:
+            result = self.api.storage.conn.execute("""
+                SELECT regime_id, regime_descriptor
+                FROM regimes
+                WHERE date <= ?
+                ORDER BY date DESC
+                LIMIT 1
+            """, [as_of_date]).df()
+            
+            if len(result) == 0:
+                return -1, "unknown"
+            
+            return int(result['regime_id'].iloc[0]), str(result['regime_descriptor'].iloc[0])
+        except Exception:
+            return -1, "unknown"
 
 
 class FeaturePipeline:
@@ -37,6 +192,7 @@ class FeaturePipeline:
         self.sentiment_builder = SentimentFeatureBuilder(api) if self.config.get('sentiment', {}).get('enabled', False) else None
         self.options_builder = OptionsFeatureBuilder(api) if self.config.get('options', {}).get('enabled', False) else None
         self.microstructure_builder = MicrostructureFeatureBuilder(api) if self.config.get('microstructure', {}).get('enabled', False) else None
+        self.regime_builder = RegimeFeatureBuilder(api) if self.config.get('regimes', {}).get('enabled', False) else None
         
         # Scaler manager
         self.scaler_manager = ScalerManager()
@@ -114,13 +270,44 @@ class FeaturePipeline:
             if len(micro_features) > 0:
                 all_features.append(micro_features)
         
+        # Regime features
+        if self.regime_builder:
+            regime_features = self.regime_builder.build_features(as_of_date, universe)
+            if len(regime_features) > 0:
+                all_features.append(regime_features)
+        
         # Merge all features
         if len(all_features) == 0:
             return pd.DataFrame(columns=['asset_id', 'date'])
         
+        # Ensure all feature DataFrames have date and asset_id columns
+        for i, features in enumerate(all_features):
+            if 'date' not in features.columns:
+                features['date'] = as_of_date
+            else:
+                # Normalize date column to date type (not datetime)
+                features['date'] = pd.to_datetime(features['date']).dt.date
+            if 'asset_id' not in features.columns:
+                # Skip this feature set if it doesn't have asset_id
+                all_features[i] = None
+        
+        # Filter out None entries
+        all_features = [f for f in all_features if f is not None and len(f) > 0]
+        
+        if len(all_features) == 0:
+            return pd.DataFrame(columns=['asset_id', 'date'])
+        
         result = all_features[0]
+        # Ensure result date is date type
+        if 'date' in result.columns:
+            result['date'] = pd.to_datetime(result['date']).dt.date
+        
         for features in all_features[1:]:
-            result = result.merge(features, on=['asset_id', 'date'], how='outer')
+            # Ensure both have date and asset_id for merge
+            if 'date' in features.columns and 'asset_id' in features.columns:
+                # Normalize date type
+                features['date'] = pd.to_datetime(features['date']).dt.date
+                result = result.merge(features, on=['asset_id', 'date'], how='outer')
         
         # Fill NaN with 0 for numeric columns (or use forward fill for time series)
         numeric_cols = result.select_dtypes(include=[np.number]).columns

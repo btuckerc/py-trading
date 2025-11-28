@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 
+    Mac launchd plist for daily paper trading
+    
+    Installation:
+    1. Copy this file to ~/Library/LaunchAgents/
+    2. Edit WorkingDirectory and ProgramArguments paths to match your setup
+    3. Load with: launchctl load ~/Library/LaunchAgents/com.pyfinance.daily-trading.plist
+    4. Unload with: launchctl unload ~/Library/LaunchAgents/com.pyfinance.daily-trading.plist
+    
+    The job runs at 4:30 PM local time on weekdays (Mon-Fri).
+    Adjust StartCalendarInterval for your timezone if needed.
+    -->
+    
+    <key>Label</key>
+    <string>com.pyfinance.daily-trading</string>
+    
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/py-finance</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/py-finance/scripts/cron_daily_trading.sh</string>
+    </array>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>BROKER_MODE</key>
+        <string>paper</string>
+    </dict>
+    
+    <!-- Run at 4:30 PM on weekdays -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <!-- Monday -->
+        <dict>
+            <key>Weekday</key>
+            <integer>1</integer>
+            <key>Hour</key>
+            <integer>16</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <!-- Tuesday -->
+        <dict>
+            <key>Weekday</key>
+            <integer>2</integer>
+            <key>Hour</key>
+            <integer>16</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <!-- Wednesday -->
+        <dict>
+            <key>Weekday</key>
+            <integer>3</integer>
+            <key>Hour</key>
+            <integer>16</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <!-- Thursday -->
+        <dict>
+            <key>Weekday</key>
+            <integer>4</integer>
+            <key>Hour</key>
+            <integer>16</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <!-- Friday -->
+        <dict>
+            <key>Weekday</key>
+            <integer>5</integer>
+            <key>Hour</key>
+            <integer>16</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+    </array>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/py-finance/logs/launchd_stdout.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/py-finance/logs/launchd_stderr.log</string>
+    
+    <!-- Don't run if already running -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+    
+    <!-- Keep the job enabled -->
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
+

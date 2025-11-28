@@ -157,10 +157,16 @@ class StorageBackend:
     
     def insert_dataframe(self, table_name: str, df: pd.DataFrame, if_exists: str = "append"):
         """Insert DataFrame into DuckDB table."""
+        if len(df) == 0:
+            return
+        
         if if_exists == "replace":
             self.conn.execute(f"DELETE FROM {table_name}")
         
-        self.conn.execute(f"INSERT INTO {table_name} SELECT * FROM df", parameters={"df": df})
+        # Register DataFrame as a temporary view and insert from it
+        self.conn.register('temp_df', df)
+        self.conn.execute(f"INSERT INTO {table_name} SELECT * FROM temp_df")
+        self.conn.unregister('temp_df')
     
     def close(self):
         """Close DuckDB connection."""

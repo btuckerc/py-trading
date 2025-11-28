@@ -14,20 +14,20 @@ from data.vendors.tiingo import TiingoClient
 from data.normalize import DataNormalizer
 from data.quality import DataQualityChecker
 from configs.loader import get_config
+from loguru import logger
 
 
 def main():
     parser = argparse.ArgumentParser(description="Ingest daily bars from vendors")
-    parser.add_argument("--start-date", type=str, required=True, help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end-date", type=str, required=True, help="End date (YYYY-MM-DD)")
+    parser.add_argument("--start-date", type=str, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, help="End date (YYYY-MM-DD)")
     parser.add_argument("--symbols", type=str, nargs="+", help="List of symbols to ingest")
     parser.add_argument("--vendor", type=str, default="yahoo", choices=["yahoo", "tiingo"], help="Vendor to use")
     parser.add_argument("--check-quality", action="store_true", help="Run quality checks after ingestion")
+    parser.add_argument("--update-metadata", action="store_true", help="Update sector/industry metadata for all assets with missing data")
+    parser.add_argument("--update-metadata-symbols", type=str, nargs="+", help="Update metadata for specific symbols")
     
     args = parser.parse_args()
-    
-    start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date()
-    end_date = datetime.strptime(args.end_date, "%Y-%m-%d").date()
     
     config = get_config()
     storage = StorageBackend(
@@ -42,6 +42,24 @@ def main():
         vendor_client = TiingoClient()
     else:
         raise ValueError(f"Unknown vendor: {args.vendor}")
+    
+    # Initialize normalizer with vendor client for metadata fetching
+    normalizer = DataNormalizer(storage, vendor_client=vendor_client)
+    
+    # Handle metadata-only update mode
+    if args.update_metadata or args.update_metadata_symbols:
+        symbols_to_update = args.update_metadata_symbols if args.update_metadata_symbols else None
+        normalizer.update_asset_metadata(symbols=symbols_to_update)
+        storage.close()
+        print("Metadata update complete")
+        return
+    
+    # Regular bar ingestion mode requires dates
+    if not args.start_date or not args.end_date:
+        parser.error("--start-date and --end-date are required for bar ingestion")
+    
+    start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date()
+    end_date = datetime.strptime(args.end_date, "%Y-%m-%d").date()
     
     # Get symbols
     if args.symbols:
@@ -61,8 +79,7 @@ def main():
     
     print(f"Fetched {len(bars_df)} bars")
     
-    # Normalize
-    normalizer = DataNormalizer(storage)
+    # Normalize (this will automatically fetch sector/industry for new assets)
     normalized_bars = normalizer.normalize_bars(bars_df, vendor=args.vendor)
     
     print(f"Normalized to {len(normalized_bars)} records")

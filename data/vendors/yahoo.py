@@ -2,9 +2,10 @@
 
 import yfinance as yf
 import pandas as pd
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import date, datetime
 from .base import BaseVendorClient
+from loguru import logger
 
 
 class YahooClient(BaseVendorClient):
@@ -12,6 +13,60 @@ class YahooClient(BaseVendorClient):
     
     def __init__(self):
         self.name = "yahoo"
+    
+    def fetch_asset_info(self, symbols: List[str]) -> pd.DataFrame:
+        """
+        Fetch asset metadata including sector and industry from Yahoo Finance.
+        
+        Args:
+            symbols: List of ticker symbols
+        
+        Returns:
+            DataFrame with columns: symbol, sector, industry, exchange, currency, name
+        """
+        all_info = []
+        
+        for symbol in symbols:
+            try:
+                ticker = yf.Ticker(symbol)
+                info = ticker.info
+                
+                # Extract relevant fields with fallbacks
+                asset_info = {
+                    'symbol': symbol,
+                    'sector': info.get('sector'),
+                    'industry': info.get('industry'),
+                    'exchange': info.get('exchange'),
+                    'currency': info.get('currency', 'USD'),
+                    'name': info.get('longName') or info.get('shortName'),
+                    'quote_type': info.get('quoteType'),  # EQUITY, ETF, etc.
+                }
+                
+                # Handle ETFs which don't have sector/industry
+                if asset_info['quote_type'] == 'ETF':
+                    asset_info['sector'] = 'ETF'
+                    asset_info['industry'] = info.get('category', 'Index ETF')
+                
+                all_info.append(asset_info)
+                logger.debug(f"Fetched info for {symbol}: sector={asset_info['sector']}, industry={asset_info['industry']}")
+                
+            except Exception as e:
+                logger.warning(f"Error fetching info for {symbol}: {e}")
+                # Add placeholder entry
+                all_info.append({
+                    'symbol': symbol,
+                    'sector': None,
+                    'industry': None,
+                    'exchange': None,
+                    'currency': 'USD',
+                    'name': None,
+                    'quote_type': None,
+                })
+        
+        if len(all_info) == 0:
+            return pd.DataFrame(columns=['symbol', 'sector', 'industry', 'exchange', 'currency', 'name', 'quote_type'])
+        
+        return pd.DataFrame(all_info)
     
     def fetch_daily_bars(
         self,

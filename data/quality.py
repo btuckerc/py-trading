@@ -167,7 +167,8 @@ class DataQualityChecker:
             return pd.DataFrame(columns=['asset_id', 'date', 'volume', 'median_volume', 'ratio', 'issue_type'])
         
         for asset_id, asset_bars in bars_df.groupby('asset_id'):
-            asset_bars = asset_bars.sort_values('date')
+            # Reset index to ensure positional indexing works correctly
+            asset_bars = asset_bars.sort_values('date').reset_index(drop=True)
             volumes = asset_bars['volume'].values
             
             # Compute rolling median (30-day window)
@@ -177,14 +178,13 @@ class DataQualityChecker:
             
             median_volumes = pd.Series(volumes).rolling(window=window, center=False).median()
             
-            for idx, row in asset_bars.iterrows():
-                if idx < window - 1:
-                    continue
-                
+            # Iterate using positional index
+            for pos_idx in range(window - 1, len(asset_bars)):
+                row = asset_bars.iloc[pos_idx]
                 volume = row['volume']
-                median_vol = median_volumes.iloc[idx]
+                median_vol = median_volumes.iloc[pos_idx]
                 
-                if median_vol > 0:
+                if pd.notna(median_vol) and median_vol > 0:
                     ratio = volume / median_vol
                     if ratio > volume_threshold_multiplier:
                         outliers.append({

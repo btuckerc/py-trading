@@ -1,0 +1,50 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+ENV
+env
+*.egg-info
+.eggs
+dist
+build
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+.cursor
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.log
+.env
+.env.local
+.env.*.local
+
+# Large data files (we mount these as volumes instead)
+data/raw_vendor/
+data/normalized/*.parquet
+data/*.duckdb
+
+# Notebooks
+notebooks/
+*.ipynb
+
+# Test artifacts
+.pytest_cache
+.coverage
+htmlcov
+

@@ -121,18 +121,35 @@ class UniverseManager:
         
         membership_df = pd.DataFrame(membership_records)
         
-        # Note: asset_id will be assigned during normalization
-        # For now, we use symbol as a placeholder
-        if 'asset_id' not in membership_df.columns:
-            membership_df['asset_id'] = membership_df['symbol']  # Temporary
-        
-        return membership_df[['date', 'asset_id', 'index_name', 'in_index']]
+        # Return with symbol column - will be mapped to asset_id later
+        return membership_df
     
-    def get_universe_at_date(self, as_of_date: date, index_name: str = "SP500") -> Set[str]:
-        """Get set of symbols in universe at a specific date."""
-        # This would query the universe_membership table
-        # For now, return empty set as placeholder
-        return set()
+    def get_universe_at_date(self, as_of_date: date, index_name: str = "SP500") -> Set[int]:
+        """
+        Get set of asset_ids in universe at a specific date.
+        
+        Queries the universe_membership table in DuckDB.
+        
+        Returns:
+            Set of asset_ids that were in the index on as_of_date
+        """
+        import duckdb
+        
+        try:
+            conn = duckdb.connect(self.db_path, read_only=True)
+            result = conn.execute("""
+                SELECT DISTINCT asset_id
+                FROM universe_membership
+                WHERE date = ? AND index_name = ? AND in_index = TRUE
+            """, [as_of_date, index_name]).fetchdf()
+            conn.close()
+            
+            if len(result) > 0:
+                return set(result['asset_id'].values)
+            return set()
+        except Exception:
+            # Table may not exist or be empty
+            return set()
     
     def filter_universe(
         self,
@@ -177,4 +194,89 @@ class UniverseManager:
                 filtered = filtered.intersection(set(volume_filter))
         
         return filtered
+    
+    def validate_trades_against_universe(
+        self,
+        trades_df: pd.DataFrame,
+        index_name: str = "SP500"
+    ) -> dict:
+        """
+        Validate that all trades are for assets that were in the universe at trade time.
+        
+        Args:
+            trades_df: DataFrame with columns: date, asset_id
+            index_name: Index to check membership against
+        
+        Returns:
+            Dict with 'valid': bool, 'violations': list of dicts with date, asset_id
+        """
+        import duckdb
+        
+        violations = []
+        
+        try:
+            conn = duckdb.connect(self.db_path, read_only=True)
+            
+            for _, row in trades_df.iterrows():
+                trade_date = row['date']
+                asset_id = row['asset_id']
+                
+                # Check if asset was in universe on trade date
+                result = conn.execute("""
+                    SELECT COUNT(*) as cnt
+                    FROM universe_membership
+                    WHERE date = ? AND asset_id = ? AND index_name = ? AND in_index = TRUE
+                """, [trade_date, int(asset_id), index_name]).fetchone()
+                
+                if result[0] == 0:
+                    violations.append({
+                        'date': trade_date,
+                        'asset_id': asset_id,
+                        'issue': 'Asset not in universe on trade date'
+                    })
+            
+            conn.close()
+            
+            return {
+                'valid': len(violations) == 0,
+                'violations': violations,
+                'total_trades': len(trades_df),
+                'invalid_trades': len(violations)
+            }
+        except Exception as e:
+            return {
+                'valid': False,
+                'violations': [],
+                'error': str(e),
+                'total_trades': len(trades_df),
+                'invalid_trades': -1
+            }
+    
+    def get_universe_coverage(
+        self,
+        start_date: date,
+        end_date: date,
+        index_name: str = "SP500"
+    ) -> pd.DataFrame:
+        """
+        Get universe membership counts over a date range.
+        
+        Returns:
+            DataFrame with date and member_count columns
+        """
+        import duckdb
+        
+        try:
+            conn = duckdb.connect(self.db_path, read_only=True)
+            result = conn.execute("""
+                SELECT date, COUNT(DISTINCT asset_id) as member_count
+                FROM universe_membership
+                WHERE date >= ? AND date <= ? AND index_name = ? AND in_index = TRUE
+                GROUP BY date
+                ORDER BY date
+            """, [start_date, end_date, index_name]).fetchdf()
+            conn.close()
+            return result
+        except Exception:
+            return pd.DataFrame(columns=['date', 'member_count'])
 

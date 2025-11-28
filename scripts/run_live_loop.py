@@ -1,0 +1,760 @@
+"""Run daily live/paper trading loop.
+
+This script runs a daily trading loop that:
+1. Loads a trained model or trains one on historical data
+2. Builds features as-of the trading date
+3. Gets current regime and computes exposure scaling
+4. Generates predictions and portfolio weights
+5. Applies regime-aware sector tilts and exposure
+6. Submits orders to broker (paper or live)
+7. Logs all activity for monitoring
+
+Usage:
+    python scripts/run_live_loop.py --trading-date 2024-01-15 --model-type xgboost
+    python scripts/run_live_loop.py --dry-run  # Show what would happen without submitting orders
+    python scripts/run_live_loop.py --regime-aware  # Enable regime-aware exposure and sector tilts
+    python scripts/run_live_loop.py --broker alpaca_paper  # Use Alpaca paper trading
+    
+For scheduled cloud deployment:
+    # Add to crontab for daily runs at 4:30 PM ET (after market close)
+    # 30 16 * * 1-5 cd /path/to/py-finance && python scripts/run_live_loop.py --skip-if-logged
+"""
+
+import sys
+from pathlib import Path
+
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+from datetime import date, datetime
+import argparse
+import pandas as pd
+import numpy as np
+import json
+import pickle
+import hashlib
+import os
+import signal
+import time
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from data.storage import StorageBackend
+from data.asof_api import AsOfQueryAPI
+from data.universe import TradingCalendar
+from labels.returns import ReturnLabelGenerator
+from labels.regimes import RegimeLabelGenerator
+from features.pipeline import FeaturePipeline, RegimeFeatureBuilder
+from models.tabular import XGBoostModel, LightGBMModel
+from portfolio.strategies import LongTopKStrategy
+from portfolio.scores import ScoreConverter
+from portfolio.risk import RiskManager, ExposureManager, DrawdownManager, SectorTiltManager
+from live.engine import LiveEngine
+from live.paper_broker import PaperBroker
+from live.alerting import AlertManager, AlertLevel
+from configs.loader import get_config
+from loguru import logger
+
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+# Global alert manager (initialized in main)
+alert_manager = None
+
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global shutdown_requested
+    logger.warning(f"Received signal {signum}, requesting graceful shutdown...")
+    shutdown_requested = True
+
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+
+def get_config_hash(config) -> str:
+    """Generate a hash of the config for versioning."""
+    config_str = json.dumps(config, sort_keys=True, default=str)
+    return hashlib.md5(config_str.encode()).hexdigest()[:8]
+
+
+def get_symbol_to_asset_id(storage: StorageBackend) -> dict:
+    """Get mapping from symbol to asset_id."""
+    assets_df = storage.query("SELECT asset_id, symbol FROM assets")
+    if len(assets_df) == 0:
+        return {}
+    return dict(zip(assets_df['symbol'], assets_df['asset_id']))
+
+
+def get_asset_id_to_symbol(storage: StorageBackend) -> dict:
+    """Get mapping from asset_id to symbol."""
+    assets_df = storage.query("SELECT asset_id, symbol FROM assets")
+    if len(assets_df) == 0:
+        return {}
+    return dict(zip(assets_df['asset_id'], assets_df['symbol']))
+
+
+def load_or_train_model(
+    model_path: Path,
+    model_type: str,
+    storage: StorageBackend,
+    api: AsOfQueryAPI,
+    config,
+    training_end_date: date,
+    universe: set,
+    horizon: int = 20,
+    train_days: int = 750,  # ~3 years
+    force_retrain: bool = False
+) -> object:
+    """
+    Load model from disk or train a new one.
+    
+    Args:
+        model_path: Path to model artifact
+        model_type: 'xgboost' or 'lightgbm'
+        storage: Storage backend
+        api: AsOfQueryAPI
+        config: Config object
+        training_end_date: End date for training data
+        universe: Asset universe to train on
+        horizon: Prediction horizon in days
+        train_days: Number of days of training data
+        force_retrain: If True, retrain even if model exists
+    
+    Returns:
+        Trained model
+    """
+    # Check if model exists and is recent
+    if model_path.exists() and not force_retrain:
+        try:
+            with open(model_path, 'rb') as f:
+                model_data = pickle.load(f)
+            
+            # Check if model is recent enough
+            model_date = model_data.get('trained_date')
+            if model_date:
+                model_age_days = (training_end_date - model_date).days
+                retrain_frequency = config.live.get('retrain_frequency_days', 30) if hasattr(config, 'live') else 30
+                
+                if model_age_days <= retrain_frequency:
+                    logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
+                    return model_data['model']
+                else:
+                    logger.info(f"Model is {model_age_days} days old, retraining...")
+        except Exception as e:
+            logger.warning(f"Could not load model from {model_path}: {e}")
+    
+    # Train new model
+    logger.info(f"Training new {model_type} model...")
+    
+    # Calculate training period
+    training_start_date = (pd.Timestamp(training_end_date) - pd.Timedelta(days=train_days)).date()
+    
+    # Generate labels
+    label_generator = ReturnLabelGenerator(storage)
+    labels_df = label_generator.generate_labels(
+        start_date=training_start_date,
+        end_date=training_end_date,
+        horizons=[horizon],
+        benchmark_symbol="SPY",
+        universe=list(universe)
+    )
+    
+    if len(labels_df) == 0:
+        raise ValueError("No training labels generated")
+    
+    # Build features
+    feature_pipeline = FeaturePipeline(api, config.features)
+    calendar = TradingCalendar()
+    
+    # Sample training dates (every 5th day for efficiency)
+    trading_days = calendar.get_trading_days(training_start_date, training_end_date)
+    train_dates = [d.date() for d in trading_days][::5]
+    
+    logger.info(f"Building features for {len(train_dates)} training dates...")
+    
+    X_train_list = []
+    y_train_list = []
+    
+    for train_date in train_dates:
+        try:
+            features_df = feature_pipeline.build_features_cross_sectional(
+                as_of_date=train_date,
+                universe=universe,
+                lookback_days=252
+            )
+            
+            if len(features_df) == 0:
+                continue
+            
+            # Get labels for this date
+            date_labels = labels_df[labels_df['date'] == train_date]
+            if len(date_labels) == 0:
+                continue
+            
+            # Merge
+            merged = features_df.merge(
+                date_labels[['asset_id', 'target_excess_log_return']],
+                on='asset_id',
+                how='inner'
+            )
+            
+            if len(merged) == 0:
+                continue
+            
+            # Extract features
+            feature_cols = [c for c in merged.columns if c not in ['asset_id', 'date', 'target_excess_log_return']]
+            X = merged[feature_cols].copy()
+            for col in X.columns:
+                X[col] = pd.to_numeric(X[col], errors='coerce')
+            X = X.fillna(0)
+            y = merged['target_excess_log_return'].values
+            
+            X_train_list.append(X)
+            y_train_list.append(y)
+            
+        except Exception as e:
+            continue
+    
+    if len(X_train_list) == 0:
+        raise ValueError("No training data generated")
+    
+    X_train = pd.concat(X_train_list, ignore_index=True)
+    y_train = np.concatenate(y_train_list)
+    
+    logger.info(f"Training on {len(X_train)} samples with {len(X_train.columns)} features")
+    
+    # Train model
+    if model_type == "xgboost":
+        model = XGBoostModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
+    elif model_type == "lightgbm":
+        model = LightGBMModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+    
+    model.fit(X_train, y_train)
+    
+    # Save model
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    model_data = {
+        'model': model,
+        'trained_date': training_end_date,
+        'model_type': model_type,
+        'horizon': horizon,
+        'feature_cols': list(X_train.columns),
+        'training_samples': len(X_train),
+        'config_hash': get_config_hash(dict(config.features)) if hasattr(config, 'features') else None
+    }
+    
+    with open(model_path, 'wb') as f:
+        pickle.dump(model_data, f)
+    
+    logger.info(f"Model saved to {model_path}")
+    
+    return model
+
+
+def write_heartbeat(heartbeat_path: Path, status: str = "running"):
+    """Write a heartbeat file for external monitoring."""
+    heartbeat_data = {
+        'timestamp': datetime.now().isoformat(),
+        'status': status,
+        'pid': os.getpid(),
+    }
+    heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(heartbeat_path, 'w') as f:
+        json.dump(heartbeat_data, f)
+
+
+def get_sector_mapping(storage: StorageBackend) -> dict:
+    """Get mapping from asset_id to sector."""
+    try:
+        assets_df = storage.query("SELECT asset_id, sector FROM assets WHERE sector IS NOT NULL")
+        if len(assets_df) == 0:
+            return {}
+        return dict(zip(assets_df['asset_id'], assets_df['sector']))
+    except Exception:
+        return {}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run daily live/paper trading loop")
+    parser.add_argument("--trading-date", type=str, help="Trading date (YYYY-MM-DD, default: last trading day)")
+    parser.add_argument("--model-path", type=str, help="Path to trained model (default: artifacts/models/live_model.pkl)")
+    parser.add_argument("--model-type", type=str, default="xgboost", choices=["xgboost", "lightgbm"])
+    parser.add_argument("--horizon", type=int, default=20, help="Prediction horizon (days)")
+    parser.add_argument("--top-k", type=int, default=10, help="Number of top assets to hold")
+    parser.add_argument("--initial-capital", type=float, default=100000.0, help="Initial capital")
+    parser.add_argument("--symbols", type=str, nargs="+", help="Symbols to trade (default: universe_membership)")
+    parser.add_argument("--dry-run", action="store_true", help="Don't submit orders")
+    parser.add_argument("--force-retrain", action="store_true", help="Force model retraining")
+    parser.add_argument("--skip-if-logged", action="store_true", help="Skip if log already exists for date")
+    
+    # Broker selection
+    parser.add_argument("--broker", type=str, default="paper", 
+                       choices=["paper", "alpaca_paper", "alpaca_live"],
+                       help="Broker to use: paper (simulated), alpaca_paper (Alpaca paper trading), alpaca_live (Alpaca live)")
+    
+    # Regime-aware options
+    parser.add_argument("--regime-aware", action="store_true", help="Enable regime-aware exposure scaling")
+    parser.add_argument("--sector-tilts", action="store_true", help="Enable defensive sector rotation")
+    parser.add_argument("--vol-scaling", action="store_true", help="Enable VIX-style volatility scaling")
+    parser.add_argument("--drawdown-throttle", action="store_true", help="Enable drawdown throttling")
+    parser.add_argument("--regime-model-path", type=str, help="Path to fitted regime model")
+    
+    # Cloud deployment options
+    parser.add_argument("--heartbeat-path", type=str, help="Path to write heartbeat file for monitoring")
+    parser.add_argument("--max-runtime-minutes", type=int, default=30, help="Maximum runtime before timeout")
+    
+    # Alerting options
+    parser.add_argument("--enable-alerts", action="store_true", help="Enable email/Slack alerts")
+    parser.add_argument("--alert-dry-run", action="store_true", help="Log alerts but don't send them")
+    
+    args = parser.parse_args()
+    
+    # Initialize alert manager
+    global alert_manager
+    alert_manager = AlertManager(
+        email_enabled=args.enable_alerts,
+        slack_enabled=args.enable_alerts,
+        dry_run=args.alert_dry_run or args.dry_run
+    )
+    
+    # Write initial heartbeat if path specified
+    heartbeat_path = Path(args.heartbeat_path) if args.heartbeat_path else None
+    if heartbeat_path:
+        write_heartbeat(heartbeat_path, "starting")
+    
+    # Determine trading date
+    calendar = TradingCalendar()
+    if args.trading_date:
+        trading_date = datetime.strptime(args.trading_date, "%Y-%m-%d").date()
+    else:
+        today = date.today()
+        try:
+            trading_date = calendar.previous_trading_day(today)
+        except Exception:
+            trading_date = today
+    
+    logger.info(f"{'='*60}")
+    logger.info(f"LIVE TRADING LOOP - {trading_date}")
+    logger.info(f"{'='*60}")
+    
+    # Check for existing log (idempotency)
+    log_dir = Path("logs") / "live_trading"
+    log_file = log_dir / f"daily_log_{trading_date}.json"
+    
+    if args.skip_if_logged and log_file.exists():
+        logger.info(f"Log already exists for {trading_date}, skipping (use --force to override)")
+        return
+    
+    # Initialize storage and API
+    config = get_config()
+    storage = StorageBackend(
+        db_path=config.database.duckdb_path,
+        data_root=config.database.data_root
+    )
+    api = AsOfQueryAPI(storage)
+    
+    # Get universe
+    if args.symbols:
+        symbol_to_asset_id_map = get_symbol_to_asset_id(storage)
+        universe = {symbol_to_asset_id_map[s] for s in args.symbols if s in symbol_to_asset_id_map}
+        logger.info(f"Using specified symbols: {args.symbols}")
+    else:
+        try:
+            universe = api.get_universe_at_date(trading_date, index_name="SP500")
+            if len(universe) == 0:
+                bars_df = api.get_bars_asof(trading_date)
+                universe = set(bars_df['asset_id'].unique())
+                logger.info(f"Using all assets in database: {len(universe)}")
+            else:
+                logger.info(f"Using S&P 500 universe: {len(universe)} assets")
+        except Exception as e:
+            logger.warning(f"Could not load universe from membership table: {e}")
+            bars_df = api.get_bars_asof(trading_date)
+            universe = set(bars_df['asset_id'].unique())
+            logger.info(f"Using all assets in database: {len(universe)}")
+    
+    if len(universe) == 0:
+        logger.error("No assets found in universe")
+        storage.close()
+        return
+    
+    # Get mappings
+    asset_id_to_symbol = get_asset_id_to_symbol(storage)
+    
+    # Load or train model
+    model_path = Path(args.model_path) if args.model_path else Path("artifacts/models/live_model.pkl")
+    
+    try:
+        model = load_or_train_model(
+            model_path=model_path,
+            model_type=args.model_type,
+            storage=storage,
+            api=api,
+            config=config,
+            training_end_date=(pd.Timestamp(trading_date) - pd.Timedelta(days=1)).date(),
+            universe=universe,
+            horizon=args.horizon,
+            force_retrain=args.force_retrain
+        )
+    except Exception as e:
+        logger.error(f"Failed to load/train model: {e}")
+        if args.enable_alerts and alert_manager:
+            alert_manager.send_error_alert(
+                error_type="Model Loading/Training",
+                error_message=str(e),
+                context={"trading_date": str(trading_date), "model_type": args.model_type}
+            )
+        storage.close()
+        return
+    
+    # Initialize regime and exposure components
+    regime_descriptor = "unknown"
+    exposure_scale = 1.0
+    regime_builder = RegimeFeatureBuilder(api)
+    
+    # Get current regime if regime-aware mode enabled
+    if args.regime_aware or args.sector_tilts or args.vol_scaling:
+        try:
+            # Try to get regime from database
+            regime_id, regime_descriptor = regime_builder.get_current_regime(trading_date)
+            logger.info(f"Current market regime: {regime_descriptor}")
+            
+            # Load regime model if path specified
+            if args.regime_model_path and Path(args.regime_model_path).exists():
+                regime_generator = RegimeLabelGenerator(storage)
+                regime_generator.load_model(args.regime_model_path)
+                regime_id, regime_descriptor = regime_generator.predict_regime(trading_date)
+                logger.info(f"Regime from model: {regime_descriptor}")
+        except Exception as e:
+            logger.warning(f"Could not determine regime: {e}, using default")
+            regime_descriptor = "bear_low_vol"  # Conservative default
+    
+    # Initialize exposure manager
+    exposure_manager = None
+    if args.regime_aware or args.vol_scaling:
+        # Get regime policy from config
+        regime_policy = config.portfolio.get('regime_policy', {}).get('exposure_multipliers', {})
+        vol_config = config.portfolio.get('volatility_scaling', {})
+        
+        exposure_manager = ExposureManager(
+            regime_policy=regime_policy if regime_policy else None,
+            volatility_config=vol_config if vol_config else None,
+            enabled=True
+        )
+        
+        # Update regime
+        exposure_manager.update_regime(regime_descriptor)
+        
+        # Update volatility if vol scaling enabled
+        if args.vol_scaling:
+            regime_features = regime_builder._get_raw_regime_features(trading_date)
+            realized_vol = regime_features.get('realized_vol_20d', 0.15)
+            exposure_manager.update_volatility(realized_vol)
+            logger.info(f"Realized vol (20d): {realized_vol:.2%}")
+        
+        exposure_scale = exposure_manager.get_combined_scale()
+        logger.info(f"Exposure scale (regime + vol): {exposure_scale:.2%}")
+    
+    # Initialize drawdown manager
+    drawdown_manager = None
+    if args.drawdown_throttle:
+        dd_config = config.portfolio.get('drawdown', {})
+        drawdown_manager = DrawdownManager(
+            throttle_threshold_pct=dd_config.get('throttle_threshold_pct', 0.15),
+            max_drawdown_pct=dd_config.get('max_drawdown_pct', 0.25),
+            min_scale_factor=dd_config.get('min_scale_factor', 0.25),
+            recovery_threshold_pct=dd_config.get('recovery_threshold_pct', 0.05)
+        )
+    
+    # Initialize sector tilt manager
+    sector_tilt_manager = None
+    sector_mapping = {}
+    if args.sector_tilts:
+        sector_policy = config.portfolio.get('sector_policy', {}).get('tilts', {})
+        sector_tilt_manager = SectorTiltManager(
+            sector_policy=sector_policy if sector_policy else None,
+            enabled=True
+        )
+        sector_tilt_manager.update_regime(regime_descriptor)
+        sector_mapping = get_sector_mapping(storage)
+        logger.info(f"Sector tilts enabled for regime: {regime_descriptor}")
+    
+    # Initialize risk manager with sector tilt support
+    risk_config = config.portfolio.get('risk', {})
+    risk_manager = RiskManager(
+        max_position_pct=risk_config.get('max_position_pct', 0.20),
+        min_position_pct=risk_config.get('min_position_pct', 0.02),
+        max_sector_pct=risk_config.get('max_sector_pct', 0.40),
+        max_gross_exposure=risk_config.get('max_gross_exposure', 1.0),
+        max_net_exposure=risk_config.get('max_net_exposure', 1.0),
+        stop_loss_pct=risk_config.get('stop_loss_pct', 0.10),
+        sector_mapping=sector_mapping,
+        sector_tilt_manager=sector_tilt_manager
+    )
+    
+    # Initialize components
+    feature_pipeline = FeaturePipeline(api, config.features)
+    strategy = LongTopKStrategy(
+        k=args.top_k,
+        min_score_threshold=-np.inf,
+        risk_manager=risk_manager,
+        exposure_manager=exposure_manager
+    )
+    # Initialize broker based on selection
+    if args.broker == "paper":
+        broker = PaperBroker(initial_capital=args.initial_capital, api=api, as_of_date=trading_date)
+        logger.info("Using PaperBroker (simulated)")
+    elif args.broker == "alpaca_paper":
+        from live.alpaca_broker import AlpacaBroker
+        broker = AlpacaBroker(paper=True)
+        logger.info("Using AlpacaBroker (PAPER mode)")
+    elif args.broker == "alpaca_live":
+        from live.alpaca_broker import AlpacaBroker
+        # Safety check: require explicit environment variable for live trading
+        import os
+        if os.environ.get("LIVE_TRADING_ENABLED") != "1":
+            logger.error("Live trading requires LIVE_TRADING_ENABLED=1 environment variable")
+            if args.enable_alerts and alert_manager:
+                alert_manager.send_error_alert(
+                    error_type="Live Trading Blocked",
+                    error_message="Attempted live trading without LIVE_TRADING_ENABLED=1",
+                    context={"trading_date": str(trading_date)}
+                )
+            storage.close()
+            return
+        broker = AlpacaBroker(paper=False)
+        logger.info("Using AlpacaBroker (LIVE mode) - REAL MONEY")
+    else:
+        logger.error(f"Unknown broker: {args.broker}")
+        storage.close()
+        return
+    
+    # Update heartbeat
+    if heartbeat_path:
+        write_heartbeat(heartbeat_path, "running")
+    
+    # Build features
+    logger.info(f"Building features as-of {trading_date}...")
+    features_df = feature_pipeline.build_features_cross_sectional(
+        as_of_date=trading_date,
+        universe=universe,
+        lookback_days=252
+    )
+    
+    if len(features_df) == 0:
+        logger.error("No features generated")
+        storage.close()
+        return
+    
+    logger.info(f"Generated features for {len(features_df)} assets")
+    
+    # Prepare features
+    feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date']]
+    X = features_df[feature_cols].copy()
+    for col in X.columns:
+        X[col] = pd.to_numeric(X[col], errors='coerce')
+    X = X.fillna(0)
+    
+    # Generate predictions
+    logger.info("Generating predictions...")
+    predictions = model.predict(X)
+    
+    # Create scores DataFrame
+    scores_df = pd.DataFrame({
+        'asset_id': features_df['asset_id'].values,
+        'score': predictions,
+        'confidence': np.ones(len(predictions)) * 0.8
+    })
+    
+    # Check for shutdown request
+    if shutdown_requested:
+        logger.warning("Shutdown requested, aborting before order generation")
+        storage.close()
+        return
+    
+    # Compute target weights (with regime-aware exposure and sector tilts)
+    logger.info("Computing portfolio weights...")
+    target_weights_df = strategy.compute_weights(
+        scores_df,
+        as_of_date=trading_date,
+        exposure_scale=exposure_scale,
+        current_regime=regime_descriptor
+    )
+    
+    if len(target_weights_df) == 0:
+        logger.warning("No target positions generated")
+        storage.close()
+        return
+    
+    logger.info(f"Target positions: {len(target_weights_df)} assets")
+    
+    # Print target allocations
+    logger.info("Target allocations:")
+    for _, row in target_weights_df.iterrows():
+        symbol = asset_id_to_symbol.get(row['asset_id'], f"Asset_{row['asset_id']}")
+        logger.info(f"  {symbol}: {row['weight']*100:.1f}%")
+    
+    # Generate orders
+    orders = []
+    account_value = broker.get_account_value()
+    
+    for _, row in target_weights_df.iterrows():
+        asset_id = row['asset_id']
+        target_weight = row['weight']
+        symbol = asset_id_to_symbol.get(asset_id)
+        
+        if not symbol:
+            logger.warning(f"No symbol mapping for asset_id {asset_id}")
+            continue
+        
+        quote = broker.get_quote(symbol)
+        price = quote['last']
+        
+        if price <= 0:
+            logger.warning(f"Invalid price for {symbol}")
+            continue
+        
+        target_value = account_value * target_weight
+        shares = int(target_value / price)
+        
+        if shares > 0:
+            orders.append({
+                'symbol': symbol,
+                'side': 'buy',
+                'quantity': shares,
+                'order_type': 'market',
+                'time_in_force': 'day'
+            })
+    
+    logger.info(f"Generated {len(orders)} orders")
+    
+    # Submit orders
+    if args.dry_run:
+        logger.info("DRY RUN MODE - Orders not submitted")
+        for order in orders:
+            logger.info(f"  Would {order['side']} {order['quantity']} {order['symbol']}")
+    else:
+        logger.info("Submitting orders...")
+        submitted_orders = []
+        for order in orders:
+            try:
+                order_id = broker.submit_order(
+                    symbol=order['symbol'],
+                    side=order['side'],
+                    quantity=order['quantity'],
+                    order_type=order['order_type'],
+                    time_in_force=order['time_in_force']
+                )
+                logger.info(f"  Submitted: {order['side']} {order['quantity']} {order['symbol']} (ID: {order_id})")
+                submitted_orders.append({**order, 'order_id': order_id, 'status': 'submitted'})
+            except Exception as e:
+                logger.error(f"  Failed: {order['symbol']} - {e}")
+                submitted_orders.append({**order, 'error': str(e), 'status': 'failed'})
+    
+    # Save log
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get exposure manager state if available
+    exposure_state = {}
+    if exposure_manager:
+        exposure_state = exposure_manager.get_state()
+    
+    # Get drawdown state if available
+    drawdown_state = {}
+    if drawdown_manager:
+        drawdown_state = {
+            'current_drawdown': drawdown_manager.get_current_drawdown(broker.get_account_value()),
+            'is_throttled': drawdown_manager.is_throttled,
+            'scale_factor': drawdown_manager.current_scale_factor,
+        }
+    
+    daily_log = {
+        'trading_date': str(trading_date),
+        'timestamp': datetime.now().isoformat(),
+        'model_type': args.model_type,
+        'model_path': str(model_path),
+        'horizon': args.horizon,
+        'top_k': args.top_k,
+        'universe_size': len(universe),
+        'features_generated': len(features_df),
+        
+        # Regime and exposure info
+        'regime': {
+            'descriptor': regime_descriptor,
+            'exposure_scale': exposure_scale,
+        },
+        'exposure_state': exposure_state,
+        'drawdown_state': drawdown_state,
+        'regime_aware_enabled': args.regime_aware,
+        'sector_tilts_enabled': args.sector_tilts,
+        'vol_scaling_enabled': args.vol_scaling,
+        'drawdown_throttle_enabled': args.drawdown_throttle,
+        
+        # Positions and orders
+        'target_positions': target_weights_df.to_dict('records') if len(target_weights_df) > 0 else [],
+        'orders': submitted_orders if not args.dry_run else [{'dry_run': True, **o} for o in orders],
+        'account_value': broker.get_account_value(),
+        'cash': broker.cash,
+        'positions': broker.get_positions(),
+        'config_hash': get_config_hash(dict(config.features)) if hasattr(config, 'features') else None
+    }
+    
+    with open(log_file, 'w') as f:
+        json.dump(daily_log, f, indent=2, default=str)
+    
+    logger.info(f"Log saved to {log_file}")
+    
+    # Update heartbeat with completion
+    if heartbeat_path:
+        write_heartbeat(heartbeat_path, "completed")
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("DAILY TRADING SUMMARY")
+    print("="*60)
+    print(f"Date: {trading_date}")
+    print(f"Mode: {'DRY RUN' if args.dry_run else 'LIVE'}")
+    print(f"Model: {args.model_type} ({args.horizon}d horizon)")
+    print(f"Regime: {regime_descriptor}")
+    print(f"Exposure Scale: {exposure_scale:.0%}")
+    print(f"Account Value: ${broker.get_account_value():,.2f}")
+    print(f"Cash: ${broker.cash:,.2f}")
+    print(f"Positions: {len(broker.get_positions())}")
+    print(f"Orders: {len(orders)}")
+    
+    if args.regime_aware:
+        print(f"\nRegime-Aware Features:")
+        print(f"  Regime Scaling: {'Enabled' if args.regime_aware else 'Disabled'}")
+        print(f"  Sector Tilts: {'Enabled' if args.sector_tilts else 'Disabled'}")
+        print(f"  Vol Scaling: {'Enabled' if args.vol_scaling else 'Disabled'}")
+        print(f"  DD Throttle: {'Enabled' if args.drawdown_throttle else 'Disabled'}")
+    
+    print("="*60)
+    
+    # Send daily summary alert if enabled
+    if args.enable_alerts and alert_manager:
+        alert_manager.send_daily_summary(
+            trading_date=str(trading_date),
+            regime=regime_descriptor,
+            exposure_scale=exposure_scale,
+            account_value=broker.get_account_value(),
+            positions=len(broker.get_positions()),
+            orders=len(orders),
+            additional_metrics={
+                "Mode": "DRY RUN" if args.dry_run else "LIVE",
+                "Model": args.model_type,
+            }
+        )
+    
+    storage.close()
+
+
+if __name__ == "__main__":
+    main()

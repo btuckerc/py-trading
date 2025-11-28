@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from typing import List
+from typing import List, Dict
 
 
 class ConvLSTMModel(nn.Module):

@@ -37,6 +37,7 @@ class Config(BaseModel):
     backtest: Dict[str, Any] = Field(default_factory=dict)
     training: Dict[str, Any] = Field(default_factory=dict)
     live: Dict[str, Any] = Field(default_factory=dict)
+    live_gates: Dict[str, Any] = Field(default_factory=dict)
     logging: Dict[str, Any] = Field(default_factory=dict)
 
 

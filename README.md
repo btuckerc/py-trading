@@ -1,94 +1,222 @@
-# Point-in-Time ML Trading Stack
+# py-finance
 
-A research-grade, point-in-time-correct ML trading stack that:
+A point-in-time ML trading stack with regime-aware risk management.
 
-* Ingests market + fundamentals + news/sentiment + (optionally) microstructure data
-* Builds multi-horizon forecasts (1d / 1w / 1m / 6m) with uncertainty
-* Converts those into portfolio decisions and backtests them properly (no lookahead, no survivorship bias)
-* Is wired so the same code can run in "backtest mode" and "live / paper-trading mode"
+## What It Does
 
-## Design Principles
+Builds multi-horizon return forecasts, converts them to portfolio weights, and executes via paper or live brokers—all with strict point-in-time correctness (no lookahead, no survivorship bias).
 
-### Point-in-Time Correctness
-Every observation `x(t, asset)` is built only from data that would have been known at or before time `t`. This means:
-- Fundamentals use `report_release_date` to ensure only released data is used
-- News/sentiment features only aggregate events with timestamps ≤ t
-- Technical indicators use only backward-looking windows (no centered windows)
-- Growth rate estimates use only historical data available at that point in time
-
-### No Survivorship Bias
-- Uses historical S&P 500 constituents datasets to track index membership over time
-- Universe selection logic filters by what was actually tradable at each date
-- Backtests only trade assets that existed and were in the index at that time
-
-### No Lookahead Bias
-- Explicit "simulation clock" abstraction ensures all queries are "as-of" a specific date
-- Feature builders query data through the clock API, not directly from raw tables
-- Validation tests intentionally break performance when future data is leaked
-
-### Unified Backtest/Live Code Path
-- Same data ingestion, feature engineering, and model inference code used in both modes
-- Broker abstraction allows switching between paper and live trading
-- Live engine reuses exact same model artifacts and feature pipelines
-
-## Architecture
-
-```
-data/          - Raw vendor data, normalized schemas, DuckDB/Parquet storage
-features/      - Feature engineering pipelines (technical, fundamentals, sentiment)
-labels/        - Multi-horizon return labels, regime labels, event-based labels
-models/        - Baseline models, PyTorch sequence models, uncertainty estimation
-portfolio/     - Signal-to-position conversion, risk constraints, transaction costs
-backtest/      - Vectorized and event-driven backtesting engines
-live/          - Broker abstraction, paper trading, live execution loop
-configs/       - Centralized configuration files
-scripts/       - Data ingestion and processing scripts
-notebooks/     - Research notebooks and visualizations
-```
+**Key Results (2020–2024 backtest):**
+| Metric | Baseline | Regime-Aware | SPY B&H |
+|--------|----------|--------------|---------|
+| CAGR | 29.1% | 58.9% | 12.4% |
+| Sharpe | 0.54 | 1.52 | 0.65 |
+| Max DD | -64.6% | -30.2% | -33.7% |
 
 ## Quick Start
 
-1. Install dependencies:
 ```bash
-pip install -r requirements.txt
+# Setup
+uv venv --python 3.11 && source .venv/bin/activate
+uv pip install -e ".[dev]"
+brew install libomp  # Required for XGBoost/LightGBM on macOS
+
+# Ingest data
+python scripts/ingest_bars.py --start-date 2020-01-01 --end-date 2024-12-31 \
+  --symbols SPY AAPL MSFT NVDA GOOGL META AMZN
+
+# Run backtest
+python scripts/run_backtest.py --start-date 2020-01-01 --end-date 2024-12-31 \
+  --model xgboost --horizon 20 --top-k 10 --regime-aware
+
+# Paper trade (daily after market close)
+python scripts/run_live_loop.py --regime-aware --sector-tilts --drawdown-throttle --dry-run
 ```
 
-2. Set up environment variables:
-```bash
-cp .env.example .env
-# Edit .env with your API keys
+## How It Works
+
+```
+Data → Features → Model → Scores → Risk Manager → Broker
+         ↑                            ↑
+    Regime Detection ────────────────┘
 ```
 
-3. Ingest initial data:
-```bash
-python scripts/ingest_sp500_constituents.py
-python scripts/ingest_bars.py --start-date 2000-01-01 --end-date 2024-12-31
+1. **Data Layer** — Yahoo/Tiingo bars, fundamentals, news. Stored in DuckDB + Parquet with as-of query API.
+2. **Feature Pipeline** — Technical (momentum, volatility), cross-sectional (z-scores), calendar effects, regime indicators.
+3. **Models** — XGBoost/LightGBM for tabular, Conv1D+LSTM/TCN for sequences. Ensemble uncertainty via MC dropout.
+4. **Risk Management** — Position caps (20%), sector caps (40%), drawdown throttling, regime-based exposure scaling.
+5. **Execution** — Paper broker for testing, Alpaca for live (commission-free, ideal for small accounts).
+
+## Regime-Aware Trading
+
+The system detects four market regimes via K-means clustering on returns + volatility:
+
+| Regime | Exposure | Sector Tilt |
+|--------|----------|-------------|
+| `bull_low_vol` | 100% | Growth/Tech |
+| `bull_high_vol` | 40% | Balanced |
+| `bear_low_vol` | 70% | Defensive |
+| `bear_high_vol` | 25% | Max Defensive |
+
+Exposure multipliers are data-driven from historical regime performance.
+
+## Project Structure
+
+```
+data/       Storage, normalization, as-of query API
+features/   Technical, cross-sectional, fundamental, regime features  
+labels/     Return labels, regime detection
+models/     XGBoost, LightGBM, PyTorch sequence models
+portfolio/  Strategies, risk management, sector tilts
+backtest/   Vectorized backtester
+live/       Paper broker, Alpaca broker, alerting
+configs/    YAML configuration
+scripts/    CLI tools for ingestion, backtest, live trading
 ```
 
-4. Build features and labels:
+## Configuration
+
+Copy `.env.example` to `.env` and add API keys:
+
 ```bash
-python scripts/build_features.py --start-date 2000-01-01 --end-date 2024-12-31
-python scripts/build_labels.py --start-date 2000-01-01 --end-date 2024-12-31
+# Data vendors (Yahoo is free, no key needed)
+TIINGO_API_KEY=...
+
+# Broker (Alpaca recommended for small accounts)
+ALPACA_API_KEY=...
+ALPACA_SECRET_KEY=...
+
+# Alerts (optional)
+ALERT_SLACK_WEBHOOK_URL=...
 ```
 
-5. Train a baseline model:
+Risk parameters in `configs/base.yaml`:
+- `portfolio.risk.max_position_pct`: 0.20
+- `portfolio.risk.max_sector_pct`: 0.40
+- `portfolio.drawdown.throttle_threshold_pct`: 0.15
+- `portfolio.regime_policy.exposure_multipliers`: per-regime scaling
+
+## Going Live
+
+1. **Paper trade for 30+ days** — Run `scripts/run_live_loop.py` daily
+2. **Check readiness** — `python scripts/check_live_readiness.py`
+3. **Start small** — 5% allocation, ramp up per `live_gates.ramp_up_schedule`
+
+Quantitative gates before live: min 30 days paper, max 20% drawdown, max 40% volatility.
+
+## Operations
+
+### Required Environment Variables
+
+Copy `.env.example` to `.env` and configure:
+
 ```bash
-python scripts/train_baseline.py --model xgboost --train-start 2000-01-01 --train-end 2014-12-31
+# Data Vendors
+TIINGO_API_KEY=...           # Get at https://www.tiingo.com
+FINNHUB_API_KEY=...          # Get at https://finnhub.io
+
+# Alpaca Broker (commission-free, recommended for small accounts)
+ALPACA_API_KEY=...           # Get at https://alpaca.markets
+ALPACA_SECRET_KEY=...
+
+# Gmail SMTP Alerts (use App Password, not regular password)
+ALERT_EMAIL_SMTP_HOST=smtp.gmail.com
+ALERT_EMAIL_SMTP_PORT=587
+ALERT_EMAIL_USERNAME=your-email@gmail.com
+ALERT_EMAIL_PASSWORD="xxxx xxxx xxxx xxxx"  # Gmail App Password
+ALERT_EMAIL_FROM=your-email@gmail.com
+ALERT_EMAIL_TO=recipient@example.com        # Comma-separated for multiple
+
+# Slack Alerts (optional, leave empty to disable)
+ALERT_SLACK_WEBHOOK_URL=
 ```
 
-6. Run backtest:
+**Gmail App Password Setup:**
+1. Enable 2FA on your Google account
+2. Go to Google Account → Security → App passwords
+3. Generate a new app password for "Mail"
+4. Use the 16-character password (with spaces) in `ALERT_EMAIL_PASSWORD`
+
+### Daily Paper Trading Job
+
+Run after US market close (e.g., 16:30-17:00 ET):
+
 ```bash
-python scripts/run_backtest.py --strategy long_top_k --start-date 2015-01-01 --end-date 2024-12-31
+cd /path/to/py-finance
+python scripts/run_live_loop.py \
+  --skip-if-logged \
+  --regime-aware \
+  --vol-scaling \
+  --drawdown-throttle \
+  --sector-tilts \
+  --enable-alerts
 ```
 
-## Data Sources
+**Cron example (Mac mini, 4:30 PM ET = 21:30 UTC in winter):**
+```cron
+30 21 * * 1-5 cd /path/to/py-finance && source .venv/bin/activate && python scripts/run_live_loop.py --skip-if-logged --regime-aware --vol-scaling --drawdown-throttle --sector-tilts --enable-alerts >> logs/cron.log 2>&1
+```
 
-- **Historical EOD**: Tiingo, Yahoo Finance (via yfinance)
-- **Fundamentals**: Tiingo, Financial Modeling Prep
-- **News/Sentiment**: Finnhub, Alpha Vantage
-- **Universe**: Historical S&P 500 constituents (fja05680/sp500)
+### Checking Readiness Gates
+
+After 30+ trading days of paper logs:
+
+```bash
+python scripts/check_live_readiness.py --verbose
+```
+
+Gates checked:
+- `min_paper_trading_days`: 30
+- `min_paper_trades`: 50
+- `max_paper_drawdown_pct`: 0.20
+- `max_paper_volatility`: 0.40
+- `min_paper_sharpe`: 0.0
+- `max_consecutive_errors`: 3
+
+### Switching to Live Trading
+
+Once gates pass:
+
+```bash
+# Run with Alpaca paper first for final validation
+python scripts/run_live_loop.py --broker alpaca_paper --enable-alerts
+
+# Then switch to live (5% allocation recommended initially)
+python scripts/run_live_loop.py --broker alpaca_live --enable-alerts
+```
+
+### Monitoring
+
+- **Daily logs:** `logs/live_trading/daily_log_YYYY-MM-DD.json`
+- **Email alerts:** Sent on errors, regime changes, and daily summaries
+- **Readiness check:** `python scripts/check_live_readiness.py --json`
+
+### Weekly Research Job
+
+Run weekly to refresh backtest metrics:
+
+```bash
+python scripts/run_multi_horizon_backtest.py \
+  --start-date 2020-01-01 \
+  --end-date $(date +%Y-%m-%d) \
+  --model-type xgboost \
+  --horizons 1 5 20 \
+  --run-benchmarks
+```
+
+**Cron example (Sundays at 2 AM):**
+```cron
+0 2 * * 0 cd /path/to/py-finance && source .venv/bin/activate && python scripts/run_multi_horizon_backtest.py --start-date 2020-01-01 --end-date $(date +%Y-%m-%d) --model-type xgboost --horizons 1 5 20 --run-benchmarks >> logs/weekly_backtest.log 2>&1
+```
+
+## Future Direction
+
+- **Universe expansion** — Full S&P 500 with survivorship-bias-free membership
+- **Alternative data** — Options flow, short interest, insider transactions
+- **Sequence models** — Transformer architectures for longer-horizon forecasts
+- **Multi-asset** — Futures, crypto, international equities
+- **Execution optimization** — VWAP/TWAP, optimal trade scheduling
 
 ## License
 
 MIT
-

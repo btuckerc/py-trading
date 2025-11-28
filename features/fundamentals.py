@@ -2,7 +2,7 @@
 
 import pandas as pd
 import numpy as np
-from typing import Optional
+from typing import Optional, Set
 from datetime import date
 from data.asof_api import AsOfQueryAPI
 from sklearn.linear_model import LinearRegression

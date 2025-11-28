@@ -2,7 +2,7 @@
 
 import pandas as pd
 import numpy as np
-from typing import Optional
+from typing import Optional, Tuple, List
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 import xgboost as xgb
@@ -83,6 +83,89 @@ class XGBoostModel(BaseModel):
         if self.task_type == "classification":
             return self.model.predict_proba(X)
         raise ValueError("predict_proba only available for classification tasks")
+
+
+class EnsembleXGBoostModel(BaseModel):
+    """
+    Ensemble of XGBoost models for uncertainty estimation.
+    
+    Trains multiple XGBoost models with different random seeds and
+    uses the variance across predictions as uncertainty estimate.
+    """
+    
+    def __init__(
+        self,
+        task_type: str = "regression",
+        n_models: int = 5,
+        **kwargs
+    ):
+        self.task_type = task_type
+        self.n_models = n_models
+        self.models: List[xgb.XGBRegressor] = []
+        self.params = kwargs
+        self.feature_names = None
+    
+    def fit(self, X_train, y_train, X_val=None, y_val=None):
+        """Fit ensemble of XGBoost models."""
+        if isinstance(X_train, pd.DataFrame):
+            self.feature_names = X_train.columns.tolist()
+            X_train = X_train.values
+        
+        if X_val is not None and isinstance(X_val, pd.DataFrame):
+            X_val = X_val.values
+        
+        self.models = []
+        
+        for i in range(self.n_models):
+            # Create model with different random seed
+            params = self.params.copy()
+            params['random_state'] = params.get('random_state', 42) + i
+            
+            if self.task_type == "regression":
+                model = xgb.XGBRegressor(**params)
+            else:
+                model = xgb.XGBClassifier(**params)
+            
+            eval_set = [(X_val, y_val)] if X_val is not None else None
+            model.fit(X_train, y_train, eval_set=eval_set, verbose=False)
+            self.models.append(model)
+    
+    def predict(self, X) -> np.ndarray:
+        """Make predictions (mean of ensemble)."""
+        if isinstance(X, pd.DataFrame):
+            X = X.values
+        
+        predictions = np.array([model.predict(X) for model in self.models])
+        return predictions.mean(axis=0)
+    
+    def predict_with_uncertainty(self, X) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Make predictions with uncertainty estimates.
+        
+        Returns:
+            Tuple of (mean_predictions, std_predictions)
+        """
+        if isinstance(X, pd.DataFrame):
+            X = X.values
+        
+        predictions = np.array([model.predict(X) for model in self.models])
+        
+        mean_pred = predictions.mean(axis=0)
+        std_pred = predictions.std(axis=0)
+        
+        return mean_pred, std_pred
+    
+    def predict_proba(self, X):
+        """Predict probabilities (for classification)."""
+        if self.task_type != "classification":
+            raise ValueError("predict_proba only available for classification tasks")
+        
+        if isinstance(X, pd.DataFrame):
+            X = X.values
+        
+        # Average probabilities across ensemble
+        proba_list = [model.predict_proba(X) for model in self.models]
+        return np.mean(proba_list, axis=0)
 
 
 class LightGBMModel(BaseModel):

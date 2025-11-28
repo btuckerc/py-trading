@@ -3,9 +3,11 @@
 # Universe definition
 universe:
   index_name: "SP500"
+  constituents_csv_path: "data/sp500_constituents.csv"
   min_price_usd: 3.0
   min_dollar_volume_window: 20
   min_dollar_volume_percentile: 10
+  use_survivorship_bias_free: true  # If true, uses universe_membership table
 
 # Data vendors
 vendors:
@@ -29,15 +31,18 @@ features:
   cross_sectional:
     enabled: true
   fundamentals:
-    enabled: true
+    enabled: true  # Requires fundamentals data ingestion (Tiingo/Finnhub)
   sentiment:
-    enabled: false  # Requires news data
+    enabled: true  # Requires news data ingestion (Finnhub/Tiingo) - will be empty if no news data available
   calendar:
     enabled: true
   options:
     enabled: false
   microstructure:
     enabled: false
+  regimes:
+    enabled: true   # Add regime_id as a feature (requires regimes table to be populated)
+    include_probabilities: false  # Include regime transition probabilities (GMM only)
 
 # Labeling
 labels:
@@ -68,17 +73,80 @@ portfolio:
       min_score_threshold: 0.0
       min_confidence: 0.7
     - name: "long_short_deciles"
-      enabled: false
+      enabled: false   # Set to true to enable long/short variant
       long_decile: 10
       short_decile: 1
       market_neutral: true
+      regime_aware: true
+      disable_shorts_in_crisis: false  # Set true to disable shorts in bear_high_vol
   risk:
-    max_position_pct: 0.05
-    max_sector_pct: 0.25
+    max_position_pct: 0.20      # Max 20% per position (prevents single-stock concentration)
+    min_position_pct: 0.02      # Min 2% to avoid tiny positions
+    max_sector_pct: 0.40        # Max 40% per sector
     max_gross_exposure: 1.0
-    max_net_exposure: 0.2
+    max_net_exposure: 1.0       # 1.0 for long-only strategies
     stop_loss_pct: 0.10
-    max_drawdown_throttle_pct: 0.20
+  drawdown:
+    throttle_threshold_pct: 0.15   # Start throttling at 15% drawdown
+    max_drawdown_pct: 0.25         # Full throttle at 25% drawdown
+    min_scale_factor: 0.25         # Minimum 25% of normal position size
+    recovery_threshold_pct: 0.05   # Resume full exposure when DD < 5%
+  
+  # Regime-aware exposure policy
+  # Maps regime descriptors to gross exposure multipliers
+  # Updated 2025-11-28 based on regime_metrics_2020-01-01_2024-12-31.json
+  regime_policy:
+    enabled: true
+    exposure_multipliers:
+      bull_low_vol: 1.0       # Full exposure - best regime (Sharpe 1.09, DD 2.0%)
+      bull_high_vol: 0.40     # Reduced from 0.8 - volatile bull underperformed (Sharpe -5.16)
+      bear_low_vol: 0.70      # Increased from 0.5 - grinding bear was actually OK (Sharpe 0.50)
+      bear_high_vol: 0.25     # Minimal exposure in crisis (Sharpe -3.00, DD 4.1%)
+  
+  # VIX-style volatility-based position sizing
+  volatility_scaling:
+    enabled: true
+    target_vol: 0.15          # Target annualized portfolio volatility
+    vol_floor: 0.10           # Minimum vol assumption (prevents over-leverage)
+    vol_ceiling: 0.60         # Maximum vol assumption (prevents over-reduction)
+    lookback_days: 20         # Days for realized vol calculation
+    # Scale factor = target_vol / realized_vol, clamped by floor/ceiling
+  
+  # Defensive sector rotation per regime
+  sector_policy:
+    enabled: true
+    # Sector tilts by regime (positive = overweight, negative = underweight)
+    # Values are additive adjustments to base sector caps
+    tilts:
+      bull_low_vol:
+        # Favor growth/cyclical in good times
+        Technology: 0.05
+        Consumer Discretionary: 0.05
+        Financials: 0.03
+        Utilities: -0.05
+        Consumer Staples: -0.05
+      bull_high_vol:
+        # Balanced, slight quality tilt
+        Health Care: 0.03
+        Technology: 0.02
+        Consumer Discretionary: -0.02
+      bear_low_vol:
+        # Favor defensive sectors
+        Consumer Staples: 0.10
+        Health Care: 0.08
+        Utilities: 0.08
+        Technology: -0.10
+        Consumer Discretionary: -0.10
+        Financials: -0.05
+      bear_high_vol:
+        # Maximum defensive positioning
+        Consumer Staples: 0.15
+        Health Care: 0.10
+        Utilities: 0.10
+        Technology: -0.15
+        Consumer Discretionary: -0.15
+        Financials: -0.10
+        Industrials: -0.05
 
 # Transaction costs
 costs:
@@ -91,6 +159,12 @@ backtest:
   initial_capital: 100000.0
   rebalance_frequency: "daily"  # Options: daily, weekly, monthly
   execution_lag: 1  # Execute at open of day t+1 for decisions made at close of day t
+  cost_sensitivity_levels: [0, 5, 10, 20]  # bps per side to test
+  walk_forward:
+    enabled: false
+    train_years: 3
+    test_years: 1
+    step_months: 12
 
 # Training
 training:
@@ -114,13 +188,75 @@ training:
 live:
   enabled: false
   broker: "paper"  # Options: paper, alpaca, ibkr
-  schedule_time: "16:00"  # After market close
-  execution_time: "09:30"  # Market open
+  schedule_time: "16:00"  # After market close (ET)
+  execution_time: "09:30"  # Market open (ET)
   retrain_frequency_days: 30
+  
+  # Regime-aware trading controls
+  regime_aware: true           # Enable regime-based exposure scaling
+  sector_tilts: true           # Enable defensive sector rotation
+  vol_scaling: true            # Enable VIX-style volatility scaling
+  drawdown_throttle: true      # Enable drawdown-based position scaling
+  
+  # Safety controls
+  max_daily_orders: 50         # Maximum orders per day
+  min_order_value: 100         # Minimum order value in USD
+  max_position_value: 50000    # Maximum single position value
+  skip_if_logged: true         # Skip if already ran for this date
+  
+  # Cloud deployment
+  heartbeat_enabled: true
+  heartbeat_path: "logs/live_trading/heartbeat.json"
+  max_runtime_minutes: 30
+  
+  # Monitoring
+  alert_on_regime_change: true
+  alert_on_drawdown_throttle: true
+  alert_on_high_vol: true
+  high_vol_threshold: 0.30     # Alert if realized vol > 30%
 
 # Logging
 logging:
   level: "INFO"
   file: "logs/trading_stack.log"
   console: true
+
+# =============================================================================
+# Quantitative Gates for Live Trading
+# =============================================================================
+# These gates must be satisfied before moving from paper to live trading.
+# Run scripts/check_live_readiness.py to verify all gates are met.
+
+live_gates:
+  # Paper trading soak period
+  min_paper_trading_days: 30          # Minimum days of paper trading
+  min_paper_trades: 50                # Minimum trades executed in paper mode
+  
+  # Performance gates (from paper trading period)
+  max_paper_drawdown_pct: 0.20        # Max acceptable drawdown in paper mode
+  max_paper_volatility: 0.40          # Max acceptable annualized volatility
+  min_paper_sharpe: 0.0               # Minimum Sharpe ratio (0 = don't require positive)
+  
+  # Backtest alignment gates
+  max_backtest_divergence_pct: 0.10   # Max divergence between paper and backtest returns
+  
+  # System health gates
+  max_consecutive_errors: 3           # Max consecutive daily errors before halt
+  min_data_coverage_pct: 0.95         # Min % of expected data present
+  
+  # Initial live allocation (as % of total intended capital)
+  initial_live_allocation_pct: 0.05   # Start with 5% of capital
+  
+  # Ramp-up schedule (after gates are met)
+  ramp_up_schedule:
+    - days: 30
+      allocation_pct: 0.05    # 5% for first 30 days
+    - days: 60
+      allocation_pct: 0.10    # 10% for days 31-60
+    - days: 90
+      allocation_pct: 0.25    # 25% for days 61-90
+    - days: 120
+      allocation_pct: 0.50    # 50% for days 91-120
+    - days: 180
+      allocation_pct: 1.0     # 100% after 180 days
 

@@ -108,7 +108,7 @@ class CrossSectionalFeatureBuilder:
             if group_by:
                 # Rank within groups
                 result[f'{feature}_rank'] = result.groupby(['date', group_by])[feature].rank(pct=True)
-                result[f'{feature}_zscore'] = result.groupby(['date', group_by'])[feature].transform(
+                result[f'{feature}_zscore'] = result.groupby(['date', group_by])[feature].transform(
                     lambda x: (x - x.mean()) / (x.std() + 1e-10)
                 )
             else:
@@ -161,14 +161,22 @@ class CrossSectionalFeatureBuilder:
             # Rolling correlation
             rolling_corr = aligned['asset'].rolling(window).corr(aligned['benchmark'])
             
-            correlations.append({
+            # Convert index to date type for merging
+            corr_dates = pd.to_datetime(rolling_corr.index).date if hasattr(rolling_corr.index, 'date') else rolling_corr.index
+            if not isinstance(corr_dates, pd.Series):
+                corr_dates = pd.Series(corr_dates)
+            
+            correlations.append(pd.DataFrame({
                 'asset_id': asset_id,
-                'date': rolling_corr.index,
+                'date': corr_dates,
                 'correlation_to_benchmark': rolling_corr.values
-            })
+            }))
         
-        corr_df = pd.DataFrame(correlations)
-        if len(corr_df) > 0:
+        if len(correlations) > 0:
+            corr_df = pd.concat(correlations, ignore_index=True)
+            # Ensure date types match
+            corr_df['date'] = pd.to_datetime(corr_df['date']).dt.date
+            bars_df['date'] = pd.to_datetime(bars_df['date']).dt.date
             result = bars_df.merge(corr_df, on=['asset_id', 'date'], how='left')
         else:
             result = bars_df.copy()

@@ -176,15 +176,18 @@ class TechnicalFeatureBuilder:
         
         for asset_id, asset_bars in bars_df.groupby('asset_id'):
             asset_bars = asset_bars.sort_index()
-            prices = asset_bars['adj_close']
+            
+            # Reset index to get date as a column
+            asset_bars_reset = asset_bars.reset_index()
+            prices = asset_bars_reset.set_index('date')['adj_close']
             
             # Compute all feature groups
             returns_features = self.compute_returns(prices, return_windows)
             ma_features = self.compute_moving_averages(prices, ma_windows, ema_windows)
             momentum_features = self.compute_momentum(prices, momentum_windows)
             volatility_features = self.compute_volatility(prices)
-            oscillator_features = self.compute_oscillators(asset_bars.reset_index(level='asset_id'))
-            volume_features = self.compute_volume_features(asset_bars.reset_index(level='asset_id'))
+            oscillator_features = self.compute_oscillators(asset_bars_reset)
+            volume_features = self.compute_volume_features(asset_bars_reset)
             
             # Combine all features
             asset_features = pd.concat([
@@ -196,14 +199,24 @@ class TechnicalFeatureBuilder:
                 volume_features
             ], axis=1)
             
+            # Reset index to get date as column
+            asset_features = asset_features.reset_index()
             asset_features['asset_id'] = asset_id
-            asset_features = asset_features.reset_index().set_index(['date', 'asset_id'])
             
             all_features.append(asset_features)
         
         if len(all_features) == 0:
             return pd.DataFrame()
         
-        result = pd.concat(all_features)
-        return result.reset_index()
+        result = pd.concat(all_features, ignore_index=True)
+        # Ensure date and asset_id columns exist
+        if 'date' not in result.columns:
+            # Try to get date from index if it's a MultiIndex
+            if isinstance(result.index, pd.MultiIndex) and 'date' in result.index.names:
+                result = result.reset_index()
+            else:
+                # Create a dummy date column (shouldn't happen, but handle gracefully)
+                result['date'] = None
+        
+        return result
 

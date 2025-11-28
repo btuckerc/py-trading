@@ -13,7 +13,8 @@ class PaperBroker(BrokerAPI):
     def __init__(
         self,
         initial_capital: float = 100000.0,
-        api: Optional[AsOfQueryAPI] = None
+        api: Optional[AsOfQueryAPI] = None,
+        as_of_date: Optional[date] = None
     ):
         self.initial_capital = initial_capital
         self.cash = initial_capital
@@ -21,37 +22,101 @@ class PaperBroker(BrokerAPI):
         self.orders: Dict[str, Dict] = {}  # order_id -> order dict
         self.order_counter = 0
         self.api = api
+        self.as_of_date = as_of_date or date.today()
+        
+        # Cache for symbol -> asset_id mapping and prices
+        self._symbol_to_asset_id: Dict[str, int] = {}
+        self._price_cache: Dict[str, float] = {}
+        
+        # Load mappings if API is provided
+        if self.api:
+            self._load_mappings()
+    
+    def _load_mappings(self):
+        """Load symbol to asset_id mapping from database."""
+        try:
+            assets_df = self.api.storage.query("SELECT asset_id, symbol FROM assets")
+            self._symbol_to_asset_id = dict(zip(assets_df['symbol'], assets_df['asset_id']))
+        except Exception:
+            pass
+    
+    def _load_prices(self, as_of_date: Optional[date] = None):
+        """Load latest prices for all assets."""
+        query_date = as_of_date or self.as_of_date
+        try:
+            bars_df = self.api.get_bars_asof(query_date, lookback_days=5)
+            if len(bars_df) > 0:
+                # Get latest price per asset
+                latest_bars = bars_df.groupby('asset_id').last().reset_index()
+                
+                # Map asset_id to symbol
+                asset_to_symbol = {v: k for k, v in self._symbol_to_asset_id.items()}
+                for _, row in latest_bars.iterrows():
+                    symbol = asset_to_symbol.get(row['asset_id'])
+                    if symbol:
+                        self._price_cache[symbol] = row['adj_close']
+        except Exception:
+            pass
+    
+    def set_as_of_date(self, as_of_date: date):
+        """Set the simulation date and refresh prices."""
+        self.as_of_date = as_of_date
+        self._price_cache = {}
+        if self.api:
+            self._load_prices(as_of_date)
     
     def get_positions(self) -> List[Dict]:
         """Get current positions."""
-        return [
-            {
-                'symbol': symbol,
-                'quantity': pos['quantity'],
-                'avg_price': pos['avg_price'],
-                'market_value': pos.get('market_value', 0)
-            }
-            for symbol, pos in self.positions.items()
-            if pos['quantity'] != 0
-        ]
+        positions_list = []
+        for symbol, pos in self.positions.items():
+            if pos['quantity'] != 0:
+                quote = self.get_quote(symbol)
+                market_value = pos['quantity'] * quote['last']
+                positions_list.append({
+                    'symbol': symbol,
+                    'quantity': pos['quantity'],
+                    'avg_price': pos['avg_price'],
+                    'market_value': market_value
+                })
+        return positions_list
     
     def get_quote(self, symbol: str) -> Dict:
-        """Get current quote (simulated)."""
-        # In paper trading, use latest price from data
-        if self.api:
-            # Get latest bar for symbol
-            # This is simplified - would need to map symbol to asset_id
+        """Get current quote from cached prices or API."""
+        # Check cache first
+        if symbol in self._price_cache:
+            price = self._price_cache[symbol]
             return {
-                'bid': 100.0,  # Placeholder
-                'ask': 100.0,
-                'last': 100.0
+                'bid': price * 0.999,  # Simulate small spread
+                'ask': price * 1.001,
+                'last': price
             }
-        else:
-            return {
-                'bid': 100.0,
-                'ask': 100.0,
-                'last': 100.0
-            }
+        
+        # Try to get from API
+        if self.api and symbol in self._symbol_to_asset_id:
+            asset_id = self._symbol_to_asset_id[symbol]
+            try:
+                bars_df = self.api.get_bars_asof(
+                    self.as_of_date,
+                    lookback_days=5,
+                    universe={asset_id}
+                )
+                if len(bars_df) > 0:
+                    price = bars_df['adj_close'].iloc[-1]
+                    self._price_cache[symbol] = price
+                    return {
+                        'bid': price * 0.999,
+                        'ask': price * 1.001,
+                        'last': price
+                    }
+            except Exception:
+                pass
+        
+        # Fallback
+        return {
+            'bid': 100.0,
+            'ask': 100.0,
+            'last': 100.0
+        }
     
     def submit_order(
         self,
