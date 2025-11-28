@@ -147,15 +147,35 @@ class DataCoverageChecker:
                 result['missing_symbols'] = symbols
             return result
         
-        # Check for gaps at the start
-        if target_start < coverage['min_date']:
+        # Ensure we have valid date objects for comparison
+        min_date = coverage['min_date']
+        max_date = coverage['max_date']
+        
+        # Handle pandas NaT, None, or invalid dates
+        try:
+            if min_date is None or pd.isna(min_date) or max_date is None or pd.isna(max_date):
+                result['needs_backfill'] = True
+                result['backfill_ranges'] = [(target_start, target_end)]
+                if symbols:
+                    result['missing_symbols'] = symbols
+                return result
+        except (TypeError, ValueError):
+            # If comparison fails, treat as no data
             result['needs_backfill'] = True
-            result['backfill_ranges'].append((target_start, coverage['min_date'] - timedelta(days=1)))
+            result['backfill_ranges'] = [(target_start, target_end)]
+            if symbols:
+                result['missing_symbols'] = symbols
+            return result
+        
+        # Check for gaps at the start
+        if target_start < min_date:
+            result['needs_backfill'] = True
+            result['backfill_ranges'].append((target_start, min_date - timedelta(days=1)))
         
         # Check for gaps at the end
-        if target_end > coverage['max_date']:
+        if target_end > max_date:
             result['needs_backfill'] = True
-            result['backfill_ranges'].append((coverage['max_date'] + timedelta(days=1), target_end))
+            result['backfill_ranges'].append((max_date + timedelta(days=1), target_end))
         
         # Check for missing symbols (symbols with NO price data, not just missing from assets)
         if symbols:
@@ -331,15 +351,16 @@ class DataMaintenanceManager:
     
     def get_symbols_from_config(self, include_universe: bool = True) -> List[str]:
         """
-        Get list of symbols from config, universe membership, or database.
+        Get list of symbols from config, universe membership, CSV, or database.
         
         Priority:
         1. Config-specified symbol list (if any)
-        2. Universe membership symbols (if include_universe=True and universe exists)
-        3. All symbols with price data in bars_daily
+        2. Universe membership symbols (if include_universe=True and universe exists in DB)
+        3. Universe constituents CSV file (bootstrap case - empty DB)
+        4. All symbols with price data in bars_daily
         
         Args:
-            include_universe: If True, include symbols from universe_membership table
+            include_universe: If True, include symbols from universe_membership table or CSV
         """
         # Check for config-specified symbols
         data_config = self._get_config_section('data', {})
@@ -364,6 +385,22 @@ class DataMaintenanceManager:
                     return universe_df['symbol'].tolist()
             except Exception:
                 pass
+            
+            # Bootstrap case: If universe_membership is empty, read directly from CSV
+            try:
+                universe_config = self._get_config_section('universe', {})
+                csv_path = self._get_from_config(universe_config, 'constituents_csv_path', 'data/sp500_constituents.csv')
+                
+                if Path(csv_path).exists():
+                    import pandas as pd
+                    constituents_df = pd.read_csv(csv_path)
+                    if 'symbol' in constituents_df.columns:
+                        symbols_from_csv = constituents_df['symbol'].unique().tolist()
+                        if symbols_from_csv:
+                            logger.info(f"Bootstrapping from {csv_path}: {len(symbols_from_csv)} symbols")
+                            return symbols_from_csv
+            except Exception as e:
+                logger.debug(f"Could not read constituents CSV: {e}")
         
         # Fall back to symbols that have price data
         try:
@@ -387,7 +424,8 @@ class DataMaintenanceManager:
         target_end: Optional[date] = None,
         symbols: Optional[List[str]] = None,
         vendor: Optional[str] = None,
-        auto_fetch: bool = True
+        auto_fetch: bool = True,
+        bootstrap_universe: bool = True
     ) -> Dict[str, Any]:
         """
         Ensure data coverage for the specified mode and date range.
@@ -402,6 +440,7 @@ class DataMaintenanceManager:
             symbols: List of symbols (if None, uses config or all in DB)
             vendor: Data vendor to use (if None, uses config default)
             auto_fetch: If True, automatically fetch missing data
+            bootstrap_universe: If True, build universe_membership after fetching data for empty DB
         
         Returns:
             Dict with status, gaps identified, and fetch results
@@ -413,7 +452,8 @@ class DataMaintenanceManager:
             'fetch_attempted': False,
             'fetch_result': None,
             'coverage_before': None,
-            'coverage_after': None
+            'coverage_after': None,
+            'bootstrapped': False
         }
         
         # Determine target dates based on mode
@@ -526,8 +566,49 @@ class DataMaintenanceManager:
             result['status'] = 'error'
             result['message'] = f"Failed to fetch data: {total_errors} errors"
         
+        # Bootstrap universe_membership if this was a fresh database
+        if bootstrap_universe and total_bars > 0:
+            try:
+                # Check if universe_membership is empty
+                um_count = self.storage.query("SELECT COUNT(*) as cnt FROM universe_membership")
+                if um_count['cnt'].iloc[0] == 0:
+                    logger.info("Bootstrapping universe_membership from CSV...")
+                    self._bootstrap_universe_membership()
+                    result['bootstrapped'] = True
+                    result['message'] += " (universe bootstrapped)"
+            except Exception as e:
+                logger.warning(f"Could not bootstrap universe_membership: {e}")
+        
         logger.info(f"Data maintenance complete: {result['message']}")
         return result
+    
+    def _bootstrap_universe_membership(self):
+        """
+        Build universe_membership table from the constituents CSV.
+        Called automatically when database is bootstrapped from empty.
+        """
+        try:
+            from data.universe import build_membership_from_csv
+            
+            universe_config = self._get_config_section('universe', {})
+            csv_path = self._get_from_config(universe_config, 'constituents_csv_path', 'data/sp500_constituents.csv')
+            index_name = self._get_from_config(universe_config, 'index_name', 'SP500')
+            
+            if not Path(csv_path).exists():
+                logger.warning(f"Constituents CSV not found: {csv_path}")
+                return
+            
+            result = build_membership_from_csv(
+                storage=self.storage,
+                csv_path=csv_path,
+                index_name=index_name,
+                overwrite=True
+            )
+            
+            logger.info(f"Universe membership bootstrapped: {result.get('rows_inserted', 0)} rows")
+            
+        except Exception as e:
+            logger.warning(f"Failed to bootstrap universe_membership: {e}")
     
     def get_coverage_report(self, universe: Optional[Set[int]] = None) -> Dict[str, Any]:
         """
