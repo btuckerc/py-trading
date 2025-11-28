@@ -42,6 +42,7 @@ data/normalized/
 *.duckdb
 *.parquet
 *.csv
+!data/sp500_constituents.csv
 !data/**/*.example.csv
 
 # Artifacts
