@@ -520,11 +520,16 @@ class DataMaintenanceManager:
         
         # First, fetch full history for missing symbols (symbols with NO data at all)
         if gaps['missing_symbols']:
-            logger.info(f"Fetching full history for {len(gaps['missing_symbols'])} symbols with no data...")
+            # For missing symbols, always fetch from min_history_start_date regardless of mode
+            # This ensures proper bootstrapping when database is empty
+            fetch_start = self.min_history_start_date
+            fetch_end = target_end
+            
+            logger.info(f"Fetching full history for {len(gaps['missing_symbols'])} symbols with no data ({fetch_start} to {fetch_end})...")
             fetch_result = backfiller.fetch_and_store(
                 gaps['missing_symbols'], 
-                target_start,  # Full history from start
-                target_end
+                fetch_start,
+                fetch_end
             )
             all_fetch_results.append({
                 'range': (str(target_start), str(target_end)),
