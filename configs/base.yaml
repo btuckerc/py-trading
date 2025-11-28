@@ -1,0 +1,126 @@
+# Base configuration for the trading stack
+
+# Universe definition
+universe:
+  index_name: "SP500"
+  min_price_usd: 3.0
+  min_dollar_volume_window: 20
+  min_dollar_volume_percentile: 10
+
+# Data vendors
+vendors:
+  primary: "yahoo"  # Options: yahoo, tiingo, finnhub
+  fallback: "yahoo"
+  
+# Database paths
+database:
+  duckdb_path: "data/market.duckdb"
+  data_root: "data"
+  raw_vendor_dir: "data/raw_vendor"
+  normalized_dir: "data/normalized"
+
+# Feature engineering
+features:
+  technical:
+    enabled: true
+    windows: [1, 5, 20, 60, 120]
+    ma_windows: [5, 10, 20, 50, 100, 200]
+    ema_windows: [10, 20, 50]
+  cross_sectional:
+    enabled: true
+  fundamentals:
+    enabled: true
+  sentiment:
+    enabled: false  # Requires news data
+  calendar:
+    enabled: true
+  options:
+    enabled: false
+  microstructure:
+    enabled: false
+
+# Labeling
+labels:
+  horizons: [1, 5, 20, 120]  # days
+  benchmark_symbol: "SPY"
+  compute_excess_returns: true
+  compute_binary_labels: true
+
+# Models
+models:
+  baseline:
+    enabled: true
+    types: ["logistic", "xgboost", "lightgbm"]
+  sequence:
+    enabled: true
+    sequence_length: 60
+    architectures: ["conv_lstm", "tcn"]
+  uncertainty:
+    method: "mc_dropout"  # Options: mc_dropout, mean_variance
+    mc_samples: 50
+
+# Portfolio
+portfolio:
+  strategies:
+    - name: "long_top_k"
+      enabled: true
+      k: 20
+      min_score_threshold: 0.0
+      min_confidence: 0.7
+    - name: "long_short_deciles"
+      enabled: false
+      long_decile: 10
+      short_decile: 1
+      market_neutral: true
+  risk:
+    max_position_pct: 0.05
+    max_sector_pct: 0.25
+    max_gross_exposure: 1.0
+    max_net_exposure: 0.2
+    stop_loss_pct: 0.10
+    max_drawdown_throttle_pct: 0.20
+
+# Transaction costs
+costs:
+  commission_bps: 1.0  # 1 basis point per trade
+  slippage_model: "simple"  # Options: simple, volatility_based
+  slippage_bps: 2.0
+
+# Backtesting
+backtest:
+  initial_capital: 100000.0
+  rebalance_frequency: "daily"  # Options: daily, weekly, monthly
+  execution_lag: 1  # Execute at open of day t+1 for decisions made at close of day t
+
+# Training
+training:
+  time_splits:
+    - name: "split_1"
+      train_start: "2000-01-01"
+      train_end: "2014-12-31"
+      val_start: "2015-01-01"
+      val_end: "2016-12-31"
+      test_start: "2017-01-01"
+      test_end: "2018-12-31"
+    - name: "split_2"
+      train_start: "2002-01-01"
+      train_end: "2016-12-31"
+      val_start: "2017-01-01"
+      val_end: "2018-12-31"
+      test_start: "2019-01-01"
+      test_end: "2020-12-31"
+
+# Live trading
+live:
+  enabled: false
+  broker: "paper"  # Options: paper, alpaca, ibkr
+  schedule_time: "16:00"  # After market close
+  execution_time: "09:30"  # Market open
+  retrain_frequency_days: 30
+
+# Logging
+logging:
+  level: "INFO"
+  file: "logs/trading_stack.log"
+  console: true
+

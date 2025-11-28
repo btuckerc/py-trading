@@ -1,0 +1,2 @@
+"""Vendor data ingestion interfaces."""
+
