@@ -11,9 +11,20 @@ from pydantic import BaseModel, Field
 class UniverseConfig(BaseModel):
     """Universe configuration."""
     index_name: str = "SP500"
+    constituents_csv_path: str = "data/sp500_constituents.csv"
     min_price_usd: float = 3.0
     min_dollar_volume_window: int = 20
     min_dollar_volume_percentile: int = 10
+    use_survivorship_bias_free: bool = True
+
+
+class DataConfig(BaseModel):
+    """Data maintenance configuration."""
+    min_history_start_date: str = "2020-01-01"
+    max_history_lag_days: int = 1
+    auto_fetch_on_backtest: bool = True
+    auto_fetch_on_live: bool = True
+    symbols: list = Field(default_factory=list)
 
 
 class DatabaseConfig(BaseModel):
@@ -27,6 +38,9 @@ class DatabaseConfig(BaseModel):
 class Config(BaseModel):
     """Main configuration model."""
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
+    universes: Dict[str, Any] = Field(default_factory=dict)  # Named universe definitions
+    universe_defaults: Dict[str, str] = Field(default_factory=dict)  # Default universe per mode
+    data: DataConfig = Field(default_factory=DataConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     vendors: Dict[str, str] = Field(default_factory=dict)
     features: Dict[str, Any] = Field(default_factory=dict)

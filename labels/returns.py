@@ -112,7 +112,14 @@ class ReturnLabelGenerator:
         max_horizon = max(horizons)
         extended_end = pd.Timestamp(end_date) + pd.Timedelta(days=max_horizon * 2)  # Buffer
         
-        bars_df = self.api.get_bars_asof(extended_end.date(), universe=set(universe) if universe else None)
+        # Build universe set that includes the benchmark
+        query_universe = None
+        if universe:
+            query_universe = set(universe)
+            # Always include benchmark in the query to compute excess returns
+            query_universe.add(benchmark_asset_id)
+        
+        bars_df = self.api.get_bars_asof(extended_end.date(), universe=query_universe)
         
         if len(bars_df) == 0:
             return pd.DataFrame(columns=[

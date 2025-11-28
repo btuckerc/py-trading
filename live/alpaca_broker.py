@@ -30,7 +30,7 @@ Usage:
 """
 
 import os
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from datetime import datetime
 from loguru import logger
 
@@ -437,4 +437,65 @@ class AlpacaBroker(BrokerAPI):
         except Exception as e:
             logger.error(f"Failed to get market hours: {e}")
             return {'is_open': False, 'error': str(e)}
+    
+    def is_tradable(self, symbol: str) -> bool:
+        """
+        Check if a symbol is tradable at Alpaca.
+        
+        Checks:
+        - Asset exists in Alpaca's database
+        - Asset is tradable (not halted, delisted, etc.)
+        - Asset is fractionable (optional, for small positions)
+        
+        Args:
+            symbol: Ticker symbol to check
+        
+        Returns:
+            True if the symbol can be traded, False otherwise
+        """
+        try:
+            asset = self.trading_client.get_asset(symbol)
+            
+            # Check basic tradability
+            if not asset.tradable:
+                logger.debug(f"{symbol} is not tradable at Alpaca")
+                return False
+            
+            # Check if asset is active
+            if asset.status != "active":
+                logger.debug(f"{symbol} status is {asset.status}, not active")
+                return False
+            
+            return True
+        except Exception as e:
+            logger.debug(f"Error checking tradability for {symbol}: {e}")
+            return False
+    
+    def get_asset_info(self, symbol: str) -> Optional[Dict]:
+        """
+        Get detailed asset information from Alpaca.
+        
+        Args:
+            symbol: Ticker symbol
+        
+        Returns:
+            Dict with asset info or None if not found
+        """
+        try:
+            asset = self.trading_client.get_asset(symbol)
+            return {
+                'symbol': asset.symbol,
+                'name': asset.name,
+                'exchange': asset.exchange,
+                'asset_class': asset.asset_class,
+                'tradable': asset.tradable,
+                'fractionable': asset.fractionable,
+                'marginable': asset.marginable,
+                'shortable': asset.shortable,
+                'easy_to_borrow': asset.easy_to_borrow,
+                'status': asset.status,
+            }
+        except Exception as e:
+            logger.debug(f"Error getting asset info for {symbol}: {e}")
+            return None
 

@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.storage import StorageBackend
 from data.asof_api import AsOfQueryAPI
 from data.universe import TradingCalendar
+from data.maintenance import ensure_data_coverage
 from labels.returns import ReturnLabelGenerator
 from labels.regimes import RegimeLabelGenerator
 from features.pipeline import FeaturePipeline, RegimeFeatureBuilder
@@ -359,6 +360,29 @@ def main():
         data_root=config.database.data_root
     )
     api = AsOfQueryAPI(storage)
+    
+    # Ensure data coverage (auto-fetch if enabled in config)
+    if config.data.auto_fetch_on_live:
+        logger.info("Checking data coverage (daily top-up)...")
+        coverage_result = ensure_data_coverage(
+            storage=storage,
+            config=config.__dict__,
+            mode="daily-top-up",
+            target_end=trading_date,  # Only check up to the trading date
+            auto_fetch=True
+        )
+        if coverage_result['status'] == 'error':
+            logger.error(f"Data coverage check failed: {coverage_result.get('message')}")
+            if args.enable_alerts and alert_manager:
+                alert_manager.send_error_alert(
+                    error_type="Data Coverage",
+                    error_message=coverage_result.get('message', 'Unknown error'),
+                    context={"trading_date": str(trading_date)}
+                )
+            storage.close()
+            return
+        elif coverage_result.get('gaps_identified'):
+            logger.info(f"Data coverage: {coverage_result.get('message')}")
     
     # Get universe
     if args.symbols:

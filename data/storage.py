@@ -23,10 +23,12 @@ class StorageBackend:
         # Initialize DuckDB connection
         self.conn = duckdb.connect(str(self.db_path))
         self._initialize_schema()
+        self._run_migrations()
     
     def _initialize_schema(self):
         """Initialize database schema with table definitions."""
         # Create assets table
+        # Extended schema supports multi-asset types and broader universes
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS assets (
                 asset_id INTEGER PRIMARY KEY,
@@ -38,6 +40,9 @@ class StorageBackend:
                 sector VARCHAR,
                 industry VARCHAR,
                 is_active BOOLEAN DEFAULT TRUE,
+                asset_type VARCHAR DEFAULT 'equity',  -- equity, etf, future, crypto, etc.
+                country VARCHAR DEFAULT 'US',         -- ISO country code
+                primary_exchange VARCHAR,             -- Primary listing exchange
                 UNIQUE(symbol)
             )
         """)
@@ -111,6 +116,42 @@ class StorageBackend:
                 PRIMARY KEY (date, asset_id, index_name)
             )
         """)
+    
+    def _run_migrations(self):
+        """
+        Run schema migrations to upgrade existing databases.
+        
+        This ensures that databases created with older schema versions
+        get updated with new columns without losing data.
+        """
+        # Get current columns in assets table
+        try:
+            result = self.conn.execute("DESCRIBE assets").fetchall()
+            existing_columns = {row[0] for row in result}
+        except Exception:
+            # Table doesn't exist yet, nothing to migrate
+            return
+        
+        # Define migrations: (column_name, column_definition, default_value)
+        migrations = [
+            ('asset_type', "VARCHAR DEFAULT 'equity'", 'equity'),
+            ('country', "VARCHAR DEFAULT 'US'", 'US'),
+            ('primary_exchange', 'VARCHAR', None),
+        ]
+        
+        for col_name, col_def, default_value in migrations:
+            if col_name not in existing_columns:
+                try:
+                    self.conn.execute(f"ALTER TABLE assets ADD COLUMN {col_name} {col_def}")
+                    # Set default value for existing rows if specified
+                    if default_value is not None:
+                        self.conn.execute(
+                            f"UPDATE assets SET {col_name} = ? WHERE {col_name} IS NULL",
+                            [default_value]
+                        )
+                except Exception:
+                    # Column might already exist (race condition) or other issue
+                    pass
     
     def save_parquet(self, df: pd.DataFrame, table_name: str, partition_by: Optional[List[str]] = None):
         """Save DataFrame to Parquet file."""

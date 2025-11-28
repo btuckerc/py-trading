@@ -1,7 +1,7 @@
 """Base broker interface."""
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from datetime import date, datetime
 
 
@@ -69,4 +69,43 @@ class BrokerAPI(ABC):
             List of order dicts
         """
         pass
+    
+    def is_tradable(self, symbol: str) -> bool:
+        """
+        Check if a symbol is tradable at this broker.
+        
+        Default implementation returns True for all symbols.
+        Override in subclasses for broker-specific checks.
+        
+        Args:
+            symbol: Ticker symbol to check
+        
+        Returns:
+            True if the symbol can be traded, False otherwise
+        """
+        return True
+    
+    def get_tradable_symbols(self, symbols: List[str]) -> Set[str]:
+        """
+        Filter a list of symbols to only those that are tradable.
+        
+        Args:
+            symbols: List of symbols to check
+        
+        Returns:
+            Set of tradable symbols
+        """
+        return {s for s in symbols if self.is_tradable(s)}
+    
+    def get_untradable_symbols(self, symbols: List[str]) -> Set[str]:
+        """
+        Get symbols from a list that are NOT tradable.
+        
+        Args:
+            symbols: List of symbols to check
+        
+        Returns:
+            Set of untradable symbols
+        """
+        return {s for s in symbols if not self.is_tradable(s)}
 

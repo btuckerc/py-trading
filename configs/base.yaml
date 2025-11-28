@@ -1,6 +1,8 @@
 # Base configuration for the trading stack
 
 # Universe definition
+# The 'universe' section defines the default universe settings.
+# For more flexibility, see 'universes' section below for named universe definitions.
 universe:
   index_name: "SP500"
   constituents_csv_path: "data/sp500_constituents.csv"
@@ -9,10 +11,51 @@ universe:
   min_dollar_volume_percentile: 10
   use_survivorship_bias_free: true  # If true, uses universe_membership table
 
+# Named universe definitions
+# Each universe can have its own index_name, filters, and constraints.
+# Use universe_registry.get_universe() with a universe name to get asset_ids.
+universes:
+  # Default S&P 500 universe for research
+  sp500_research:
+    index_name: "SP500"
+    min_price_usd: 3.0
+    min_dollar_volume_percentile: 10
+    use_survivorship_bias_free: true
+    description: "S&P 500 with survivorship-bias-free membership"
+  
+  # S&P 500 for live trading (same as research by default)
+  sp500_live:
+    index_name: "SP500"
+    min_price_usd: 5.0                 # Slightly higher price floor for live
+    min_dollar_volume_percentile: 20   # Higher liquidity requirement for live
+    use_survivorship_bias_free: true
+    description: "S&P 500 with stricter liquidity filters for live trading"
+  
+  # All assets in database (no index membership filter)
+  all_assets:
+    index_name: null                   # No index filter
+    min_price_usd: 1.0
+    use_survivorship_bias_free: false
+    description: "All assets in database, minimal filters"
+
+# Default universe names for different modes
+universe_defaults:
+  backtest: "sp500_research"
+  live: "sp500_live"
+
 # Data vendors
 vendors:
   primary: "yahoo"  # Options: yahoo, tiingo, finnhub
   fallback: "yahoo"
+
+# Data maintenance and coverage
+# Used by scripts/ensure_data_coverage.py and data/maintenance.py
+data:
+  min_history_start_date: "2020-01-01"  # Earliest date to guarantee bar coverage
+  max_history_lag_days: 1               # Max days behind "today" that data can be
+  auto_fetch_on_backtest: true          # Auto-fetch missing data when running backtests
+  auto_fetch_on_live: true              # Auto-fetch missing data when running live loop
+  # symbols: []                         # Optional: explicit symbol list (if empty, uses universe)
   
 # Database paths
 database:
@@ -197,6 +240,16 @@ live:
   sector_tilts: true           # Enable defensive sector rotation
   vol_scaling: true            # Enable VIX-style volatility scaling
   drawdown_throttle: true      # Enable drawdown-based position scaling
+  
+  # Tradability filter
+  # Filters research universe to broker-tradable symbols
+  tradability_filter:
+    enabled: true              # Enable tradability filtering
+    policy: "renormalize"      # Options: renormalize, cash, warn, error
+    # renormalize: Redistribute untradable weight to tradable assets
+    # cash: Park untradable weight in cash
+    # warn: Log warning but proceed with untradable assets removed
+    # error: Raise error if any assets are untradable
   
   # Safety controls
   max_daily_orders: 50         # Maximum orders per day

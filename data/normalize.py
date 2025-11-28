@@ -35,29 +35,56 @@ class DataNormalizer:
     
     def _fetch_asset_metadata(self, symbol: str) -> Dict:
         """
-        Fetch asset metadata (sector, industry, etc.) from vendor.
+        Fetch asset metadata (sector, industry, asset_type, etc.) from vendor.
         
-        Returns dict with sector, industry, exchange, currency, name fields.
+        Returns dict with sector, industry, exchange, currency, name, asset_type, country fields.
         """
+        default_metadata = {
+            'sector': None, 
+            'industry': None, 
+            'exchange': None, 
+            'currency': 'USD', 
+            'name': None,
+            'asset_type': 'equity',
+            'country': 'US',
+            'primary_exchange': None,
+        }
+        
         if self.vendor_client is None:
-            return {'sector': None, 'industry': None, 'exchange': None, 'currency': 'USD', 'name': None}
+            return default_metadata
         
         try:
             if hasattr(self.vendor_client, 'fetch_asset_info'):
                 info_df = self.vendor_client.fetch_asset_info([symbol])
                 if len(info_df) > 0:
                     row = info_df.iloc[0]
+                    
+                    # Determine asset_type from quote_type if available
+                    quote_type = row.get('quote_type', 'EQUITY')
+                    asset_type = 'equity'
+                    if quote_type == 'ETF':
+                        asset_type = 'etf'
+                    elif quote_type == 'FUTURE':
+                        asset_type = 'future'
+                    elif quote_type == 'CRYPTOCURRENCY':
+                        asset_type = 'crypto'
+                    elif quote_type == 'INDEX':
+                        asset_type = 'index'
+                    
                     return {
                         'sector': row.get('sector'),
                         'industry': row.get('industry'),
                         'exchange': row.get('exchange'),
                         'currency': row.get('currency', 'USD'),
                         'name': row.get('name'),
+                        'asset_type': asset_type,
+                        'country': 'US',  # Default to US, can be enhanced later
+                        'primary_exchange': row.get('exchange'),
                     }
         except Exception as e:
             logger.warning(f"Could not fetch metadata for {symbol}: {e}")
         
-        return {'sector': None, 'industry': None, 'exchange': None, 'currency': 'USD', 'name': None}
+        return default_metadata
     
     def _get_or_create_asset_id(self, symbol: str, exchange: Optional[str] = None) -> int:
         """Get or create asset_id for a symbol, automatically fetching sector/industry."""
@@ -68,7 +95,7 @@ class DataNormalizer:
         max_id = max(self.symbol_to_asset_id.values()) if self.symbol_to_asset_id else 0
         asset_id = max_id + 1
         
-        # Fetch metadata from vendor (sector, industry, etc.)
+        # Fetch metadata from vendor (sector, industry, asset_type, etc.)
         metadata = self._fetch_asset_metadata(symbol)
         
         # Insert into assets table
@@ -81,11 +108,18 @@ class DataNormalizer:
             'last_trade_date': None,
             'sector': metadata.get('sector'),
             'industry': metadata.get('industry'),
-            'is_active': True
+            'is_active': True,
+            'asset_type': metadata.get('asset_type', 'equity'),
+            'country': metadata.get('country', 'US'),
+            'primary_exchange': metadata.get('primary_exchange'),
         }])
         self.storage.insert_dataframe('assets', asset_df)
         
-        logger.info(f"Created asset {symbol} (id={asset_id}): sector={metadata.get('sector')}, industry={metadata.get('industry')}")
+        logger.info(
+            f"Created asset {symbol} (id={asset_id}): "
+            f"type={metadata.get('asset_type')}, sector={metadata.get('sector')}, "
+            f"industry={metadata.get('industry')}"
+        )
         
         self.symbol_to_asset_id[symbol] = asset_id
         return asset_id

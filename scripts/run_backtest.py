@@ -25,6 +25,7 @@ from data.storage import StorageBackend
 from data.asof_api import AsOfQueryAPI
 from data.clock import SimulationClock
 from data.universe import TradingCalendar
+from data.maintenance import ensure_data_coverage
 from labels.returns import ReturnLabelGenerator
 from features.pipeline import FeaturePipeline
 from models.tabular import XGBoostModel, LightGBMModel
@@ -950,20 +951,26 @@ def main():
     api = AsOfQueryAPI(storage)
     
     # Check for missing data and optionally fetch it
-    if args.auto_fetch:
-        logger.info("Checking for missing data...")
-        data_available = check_and_fetch_missing_data(
+    # Use config-driven auto_fetch or explicit --auto-fetch flag
+    auto_fetch_enabled = args.auto_fetch or config.data.auto_fetch_on_backtest
+    if auto_fetch_enabled:
+        logger.info("Checking for missing data using maintenance module...")
+        coverage_result = ensure_data_coverage(
             storage=storage,
-            start_date=start_date,
-            end_date=end_date,
+            config=config.__dict__,
+            mode="custom",
+            target_start=start_date,
+            target_end=end_date,
             symbols=args.symbols,
             vendor=args.vendor,
             auto_fetch=True
         )
-        if not data_available:
-            logger.error("Failed to fetch missing data")
+        if coverage_result['status'] == 'error':
+            logger.error(f"Failed to ensure data coverage: {coverage_result.get('message')}")
             storage.close()
             return
+        elif coverage_result['gaps_identified']:
+            logger.info(f"Data coverage result: {coverage_result.get('message')}")
     
     # Get universe
     if args.symbols:
