@@ -248,6 +248,9 @@ class FeaturePipeline:
         if self.cross_sectional_builder:
             cross_features = self.cross_sectional_builder.build_features(bars_df, as_of_date)
             if len(cross_features) > 0:
+                # Get latest features per asset (cross_sectional returns full time series)
+                cross_features = cross_features.groupby('asset_id').last().reset_index()
+                cross_features['date'] = as_of_date
                 all_features.append(cross_features)
         
         # Fundamentals
