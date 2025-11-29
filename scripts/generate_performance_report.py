@@ -608,6 +608,10 @@ def generate_summary_dashboard(results: dict, metrics: dict, colors: dict, outpu
     ax2 = fig.add_subplot(gs[0, 2])
     ax2.axis("off")
     
+    # Format values with None checks
+    spy_return_str = f"{summary['spy_return_pct']:+.2f}%" if summary.get('spy_return_pct') is not None else "N/A"
+    alpha_str = f"{summary['alpha_pct']:+.2f}%" if summary.get('alpha_pct') is not None else "N/A"
+    
     metrics_text = f"""
     PERFORMANCE SUMMARY
     ═══════════════════════════
@@ -616,8 +620,8 @@ def generate_summary_dashboard(results: dict, metrics: dict, colors: dict, outpu
     Trading Days: {summary['trading_days']}
     
     ML Strategy:     {summary['total_return_pct']:+.2f}%
-    S&P 500 (SPY):   {summary['spy_return_pct']:+.2f}%
-    Alpha:           {summary['alpha_pct']:+.2f}%
+    S&P 500 (SPY):   {spy_return_str}
+    Alpha:           {alpha_str}
     
     Sharpe Ratio:    {summary['sharpe_ratio']:.2f}
     Max Drawdown:    {summary['max_drawdown_pct']:.2f}%
@@ -866,13 +870,25 @@ def generate_html_report(results: dict, metrics: dict, charts_dir: Path, output_
     """Generate HTML report with embedded charts."""
     summary = results["summary"]
     
-    # Determine assessment
-    if summary['alpha_pct'] > 1:
+    # Determine assessment (handle None alpha_pct)
+    alpha_pct = summary.get('alpha_pct')
+    if alpha_pct is None:
+        assessment = ("➖ NO BENCHMARK DATA", "color: #6C757D;")
+        alpha_text = ""
+    elif alpha_pct > 1:
         assessment = ("✅ OUTPERFORMED", "color: #28A745;")
-    elif summary['alpha_pct'] < -1:
+        alpha_text = f" S&P 500 by {abs(alpha_pct):.2f}%"
+    elif alpha_pct < -1:
         assessment = ("❌ UNDERPERFORMED", "color: #DC3545;")
+        alpha_text = f" S&P 500 by {abs(alpha_pct):.2f}%"
     else:
         assessment = ("➖ MATCHED", "color: #6C757D;")
+        alpha_text = f" S&P 500 by {abs(alpha_pct):.2f}%"
+    
+    # Format benchmark returns with None checks
+    spy_return_pct = summary.get('spy_return_pct')
+    spy_return_str = f"{spy_return_pct:+.2f}%" if spy_return_pct is not None else "N/A"
+    spy_return_class = "positive" if (spy_return_pct or 0) > 0 else "negative" if spy_return_pct is not None else ""
     
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -947,7 +963,7 @@ def generate_html_report(results: dict, metrics: dict, charts_dir: Path, output_
         <p class="subtitle">{summary['start_date']} to {summary['end_date']} | {summary['trading_days']} trading days | {summary['universe_size']} assets</p>
         
         <div class="card">
-            <div class="assessment" style="{assessment[1]}">{assessment[0]} S&P 500 by {abs(summary['alpha_pct']):.2f}%</div>
+            <div class="assessment" style="{assessment[1]}">{assessment[0]}{alpha_text}</div>
         </div>
         
         <div class="card">
@@ -957,7 +973,7 @@ def generate_html_report(results: dict, metrics: dict, charts_dir: Path, output_
                     <div class="metric-label">ML Strategy Return</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-value {'positive' if summary['spy_return_pct'] > 0 else 'negative'}">{summary['spy_return_pct']:+.2f}%</div>
+                    <div class="metric-value {spy_return_class}">{spy_return_str}</div>
                     <div class="metric-label">S&P 500 Return</div>
                 </div>
                 <div class="metric">
