@@ -8,6 +8,10 @@
 # Manual runs:
 #   docker-compose run --rm trading python scripts/run_live_loop.py --broker alpaca_paper --enable-alerts
 #   docker-compose run --rm trading python scripts/check_live_readiness.py --verbose
+#
+# Force run (for testing/insights on weekends/holidays):
+#   docker-compose run --rm trading python scripts/run_live_loop.py --force --top-k 10
+#   # This bypasses trading-day and idempotency checks, runs in dry-run mode by default
 
 version: '3.8'
 

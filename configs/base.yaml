@@ -94,6 +94,32 @@ labels:
   compute_excess_returns: true
   compute_binary_labels: true
 
+# Benchmarks for performance comparison
+benchmarks:
+  # Named benchmark definitions
+  definitions:
+    sp500:
+      name: "S&P 500"
+      ticker: "SPY"
+      description: "S&P 500 Index ETF"
+    dow:
+      name: "Dow Jones"
+      ticker: "DIA"
+      description: "Dow Jones Industrial Average ETF"
+    nasdaq:
+      name: "Nasdaq Composite"
+      ticker: "QQQ"
+      description: "Nasdaq-100 Index ETF"
+  
+  # Default benchmarks to use when none specified (all three by default)
+  default:
+    - sp500
+    - dow
+    - nasdaq
+  
+  # Primary benchmark for alpha calculations (used as reference in summaries)
+  primary: sp500
+
 # Models
 models:
   baseline:

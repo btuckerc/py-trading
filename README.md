@@ -23,7 +23,13 @@ brew install libomp  # Required for XGBoost/LightGBM on macOS
 
 # Run backtest (data is auto-fetched if missing)
 python scripts/run_backtest.py --start-date 2020-01-01 --end-date 2024-12-31 \
-  --model xgboost --horizon 20 --top-k 10 --regime-aware
+  --model xgboost --horizon 20 --top-k 10 --regime-aware --run-benchmarks
+
+# Run backtest with specific benchmarks (default: all 3 - SPY, DIA, QQQ)
+python scripts/run_backtest.py --start-date 2020-01-01 --end-date 2024-12-31 \
+  --model xgboost --horizon 20 --top-k 10 --run-benchmarks --benchmark sp500
+python scripts/run_backtest.py --start-date 2020-01-01 --end-date 2024-12-31 \
+  --model xgboost --horizon 20 --top-k 10 --run-benchmarks --benchmarks sp500,dow,nasdaq
 
 # Paper trade (daily after market close)
 python scripts/run_live_loop.py --regime-aware --sector-tilts --drawdown-throttle --dry-run
@@ -234,9 +240,18 @@ Generate professional performance reports with charts:
 # Simulate daily trading and generate report
 python scripts/simulate_daily_trading.py --start-date 2025-09-01 --end-date 2025-11-26
 
-# Generate charts and HTML report
+# Generate charts and HTML report (shows all 3 benchmarks by default: SPY, DIA, QQQ)
 python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --html
+
+# Generate report with specific benchmark(s)
+python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --benchmark sp500
+python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --benchmarks sp500,dow,nasdaq
 ```
+
+**Benchmarks:**
+- By default, reports compare against all three major indices: S&P 500 (SPY), Dow Jones (DIA), and Nasdaq Composite (QQQ)
+- Use `--benchmark` to select a single benchmark or `--benchmarks` for a comma-separated list
+- Benchmark tickers are configurable in `configs/base.yaml` under the `benchmarks` section
 
 **Output files:**
 - `report_*.txt` — Text summary with tables
@@ -251,7 +266,9 @@ Period: 2025-09-02 to 2025-11-26 (62 trading days)
 
 ML Strategy:     +15.10%
 S&P 500 (SPY):   +6.45%
-Alpha:           +8.65%
+Dow Jones (DIA): +5.20%
+Nasdaq (QQQ):    +8.30%
+Alpha (vs SPY):  +8.65%
 
 Sharpe Ratio:    2.84
 Max Drawdown:    -5.88%

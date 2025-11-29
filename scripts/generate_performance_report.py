@@ -91,6 +91,14 @@ def parse_args():
         "--dark-mode", action="store_true",
         help="Use dark theme for charts"
     )
+    parser.add_argument(
+        "--benchmark", type=str,
+        help="Single benchmark to show (e.g., 'sp500', 'dow', 'nasdaq', or ticker like 'SPY')"
+    )
+    parser.add_argument(
+        "--benchmarks", type=str,
+        help="Comma-separated list of benchmarks to show (e.g., 'sp500,dow,nasdaq' or 'SPY,QQQ')"
+    )
     
     return parser.parse_args()
 
@@ -134,11 +142,68 @@ def calculate_metrics(results: dict) -> dict:
     
     # Extract returns
     portfolio_returns = [d["portfolio_return"] for d in daily]
-    spy_returns = [d["spy_return"] for d in daily if d["spy_return"] is not None]
+    
+    # Extract benchmark returns (support both old spy_return and new benchmark_returns)
+    benchmark_returns_dict = {}
+    spy_returns = []  # Backward compatibility
+    
+    # Get benchmark names from config
+    from configs.loader import get_config
+    config = get_config()
+    benchmark_config = getattr(config, 'benchmarks', {})
+    benchmark_definitions = benchmark_config.get('definitions', {})
+    default_benchmarks = benchmark_config.get('default', ['sp500'])
+    
+    # Map benchmark names to tickers and display names
+    benchmark_tickers = []
+    benchmark_display_names = {}
+    for bench_name in default_benchmarks:
+        if bench_name in benchmark_definitions:
+            ticker = benchmark_definitions[bench_name]['ticker']
+            display_name = benchmark_definitions[bench_name]['name']
+            benchmark_tickers.append(ticker)
+            benchmark_display_names[ticker] = display_name
+    
+    # Fallback to SPY if no benchmarks configured
+    if not benchmark_tickers:
+        benchmark_tickers = ['SPY']
+        benchmark_display_names['SPY'] = 'S&P 500'
+    
+    # Extract benchmark returns from daily results
+    for ticker in benchmark_tickers:
+        returns = []
+        for d in daily:
+            # Try new format first
+            if "benchmark_returns" in d and ticker in d["benchmark_returns"]:
+                returns.append(d["benchmark_returns"][ticker])
+            # Fallback to old spy_return for SPY
+            elif ticker == "SPY" and "spy_return" in d and d["spy_return"] is not None:
+                returns.append(d["spy_return"])
+            else:
+                returns.append(None)
+        
+        # Filter out None values and align with portfolio returns
+        valid_returns = [r for r in returns if r is not None]
+        if valid_returns:
+            benchmark_returns_dict[ticker] = {
+                "returns": returns,
+                "valid_returns": valid_returns,
+                "display_name": benchmark_display_names.get(ticker, ticker)
+            }
+            if ticker == "SPY":
+                spy_returns = valid_returns
     
     # Calculate cumulative returns
     portfolio_cumulative = np.cumprod([1 + r for r in portfolio_returns])
-    spy_cumulative = np.cumprod([1 + r for r in spy_returns])
+    
+    benchmark_cumulative = {}
+    for ticker, bench_data in benchmark_returns_dict.items():
+        valid_ret = bench_data["valid_returns"]
+        cumulative = np.cumprod([1 + r for r in valid_ret])
+        benchmark_cumulative[ticker] = cumulative.tolist()
+    
+    # Backward compatibility: spy_cumulative
+    spy_cumulative = benchmark_cumulative.get("SPY", [])
     
     # Calculate rolling metrics (21-day = ~1 month)
     window = min(21, len(portfolio_returns) // 2) if len(portfolio_returns) > 10 else len(portfolio_returns)
@@ -158,16 +223,28 @@ def calculate_metrics(results: dict) -> dict:
     
     # Monthly returns (if enough data)
     dates = [datetime.strptime(d["date"], "%Y-%m-%d") for d in daily]
-    df = pd.DataFrame({
-        "date": dates,
-        "return": portfolio_returns,
-        "spy_return": spy_returns[:len(portfolio_returns)] if spy_returns else [0] * len(portfolio_returns)
-    })
+    
+    # Build DataFrame with portfolio and all benchmark returns
+    df_data = {"date": dates, "return": portfolio_returns}
+    for ticker, bench_data in benchmark_returns_dict.items():
+        df_data[f"{ticker}_return"] = bench_data["returns"][:len(portfolio_returns)]
+    
+    # Backward compatibility: spy_return column
+    if "SPY" in benchmark_returns_dict:
+        df_data["spy_return"] = benchmark_returns_dict["SPY"]["returns"][:len(portfolio_returns)]
+    else:
+        df_data["spy_return"] = [None] * len(portfolio_returns)
+    
+    df = pd.DataFrame(df_data)
     df["month"] = df["date"].dt.to_period("M")
-    monthly = df.groupby("month").agg({
-        "return": lambda x: np.prod(1 + x) - 1,
-        "spy_return": lambda x: np.prod(1 + x) - 1
-    }).reset_index()
+    
+    # Aggregate monthly returns
+    monthly_agg = {"return": lambda x: np.prod(1 + x) - 1}
+    for ticker in benchmark_returns_dict.keys():
+        monthly_agg[f"{ticker}_return"] = lambda x: np.prod(1 + x.fillna(0)) - 1
+    monthly_agg["spy_return"] = lambda x: np.prod(1 + x.fillna(0)) - 1  # Backward compatibility
+    
+    monthly = df.groupby("month").agg(monthly_agg).reset_index()
     monthly["month_str"] = monthly["month"].astype(str)
     
     # Best/worst days
@@ -185,7 +262,9 @@ def calculate_metrics(results: dict) -> dict:
     
     return {
         "portfolio_cumulative": portfolio_cumulative.tolist(),
-        "spy_cumulative": spy_cumulative.tolist(),
+        "spy_cumulative": spy_cumulative,  # Backward compatibility
+        "benchmark_cumulative": benchmark_cumulative,  # New: all benchmarks
+        "benchmark_display_names": benchmark_display_names,  # For labels
         "drawdown": drawdown.tolist(),
         "rolling_sharpe": rolling_sharpe,
         "monthly_returns": monthly.to_dict("records"),
@@ -233,10 +312,35 @@ def generate_equity_curve(results: dict, metrics: dict, colors: dict, output_pat
     
     # Plot equity curves
     portfolio_equity = [100000 * c for c in metrics["portfolio_cumulative"]]
-    spy_equity = [100000 * c for c in metrics["spy_cumulative"][:len(dates)]]
-    
     ax.plot(dates, portfolio_equity, label="ML Strategy", color=colors["portfolio"], linewidth=2)
-    ax.plot(dates[:len(spy_equity)], spy_equity, label="S&P 500 (SPY)", color=colors["spy"], linewidth=2, linestyle="--")
+    
+    # Plot all benchmarks
+    benchmark_colors = {
+        "SPY": colors["spy"],
+        "DIA": "#FFA500",  # Orange
+        "QQQ": "#00CED1",  # Dark turquoise
+    }
+    linestyles = ["--", "-.", ":"]
+    
+    benchmark_cumulative = metrics.get("benchmark_cumulative", {})
+    benchmark_display_names = metrics.get("benchmark_display_names", {})
+    
+    # Fallback to spy_cumulative for backward compatibility
+    if not benchmark_cumulative and "spy_cumulative" in metrics:
+        spy_cumulative = metrics["spy_cumulative"]
+        if spy_cumulative:
+            benchmark_cumulative["SPY"] = spy_cumulative
+            benchmark_display_names["SPY"] = "S&P 500"
+    
+    for i, (ticker, cumulative) in enumerate(benchmark_cumulative.items()):
+        if cumulative:
+            equity = [100000 * c for c in cumulative[:len(dates)]]
+            display_name = benchmark_display_names.get(ticker, ticker)
+            color = benchmark_colors.get(ticker, colors["spy"])
+            linestyle = linestyles[i % len(linestyles)]
+            ax.plot(dates[:len(equity)], equity, 
+                   label=f"{display_name} ({ticker})", 
+                   color=color, linewidth=2, linestyle=linestyle)
     
     # Fill between
     ax.fill_between(dates, portfolio_equity, alpha=0.1, color=colors["portfolio"])
@@ -254,11 +358,21 @@ def generate_equity_curve(results: dict, metrics: dict, colors: dict, output_pat
     
     # Add final values annotation
     final_portfolio = portfolio_equity[-1]
-    final_spy = spy_equity[-1] if spy_equity else 100000
     ax.annotate(f"${final_portfolio:,.0f}", xy=(dates[-1], final_portfolio),
                 xytext=(10, 0), textcoords="offset points", fontsize=10, color=colors["portfolio"])
-    ax.annotate(f"${final_spy:,.0f}", xy=(dates[-1], final_spy),
-                xytext=(10, 0), textcoords="offset points", fontsize=10, color=colors["spy"])
+    
+    # Annotate final benchmark values
+    y_offset = 0
+    for ticker, cumulative in benchmark_cumulative.items():
+        if cumulative:
+            equity = [100000 * c for c in cumulative[:len(dates)]]
+            if equity:
+                final_value = equity[-1]
+                color = benchmark_colors.get(ticker, colors["spy"])
+                ax.annotate(f"${final_value:,.0f}", xy=(dates[-1], final_value),
+                           xytext=(10, y_offset), textcoords="offset points", 
+                           fontsize=10, color=color)
+                y_offset -= 15
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -298,7 +412,7 @@ def generate_drawdown_chart(results: dict, metrics: dict, colors: dict, output_p
 
 def generate_monthly_returns_heatmap(results: dict, metrics: dict, colors: dict, output_path: Path):
     """Generate monthly returns comparison bar chart."""
-    fig, ax = plt.subplots(figsize=(12, 5))
+    fig, ax = plt.subplots(figsize=(14, 6))
     
     monthly = metrics["monthly_returns"]
     if len(monthly) < 2:
@@ -311,21 +425,58 @@ def generate_monthly_returns_heatmap(results: dict, metrics: dict, colors: dict,
     
     months = [m["month_str"] for m in monthly]
     portfolio_returns = [m["return"] * 100 for m in monthly]
-    spy_returns = [m["spy_return"] * 100 for m in monthly]
+    
+    # Get benchmark returns
+    benchmark_colors = {
+        "SPY": colors["spy"],
+        "DIA": "#FFA500",  # Orange
+        "QQQ": "#00CED1",  # Dark turquoise
+    }
+    benchmark_display_names = metrics.get("benchmark_display_names", {})
+    
+    # Find which benchmarks are available in monthly data
+    available_benchmarks = []
+    for ticker in ["SPY", "DIA", "QQQ"]:
+        col_name = f"{ticker}_return"
+        if col_name in monthly[0]:
+            available_benchmarks.append(ticker)
+    
+    # Fallback to spy_return for backward compatibility
+    if not available_benchmarks and "spy_return" in monthly[0]:
+        available_benchmarks = ["SPY"]
     
     x = np.arange(len(months))
-    width = 0.35
+    n_bars = 1 + len(available_benchmarks)  # Portfolio + benchmarks
+    width = 0.8 / n_bars
     
-    bars1 = ax.bar(x - width/2, portfolio_returns, width, label="ML Strategy", color=colors["portfolio"])
-    bars2 = ax.bar(x + width/2, spy_returns, width, label="S&P 500", color=colors["spy"])
+    # Plot portfolio
+    offset = -(n_bars - 1) * width / 2
+    bars_portfolio = ax.bar(x + offset, portfolio_returns, width, 
+                           label="ML Strategy", color=colors["portfolio"])
+    offset += width
+    
+    # Plot benchmarks
+    benchmark_bars = {}
+    for ticker in available_benchmarks:
+        col_name = f"{ticker}_return" if ticker != "SPY" or f"{ticker}_return" in monthly[0] else "spy_return"
+        bench_returns = [m.get(col_name, 0) * 100 for m in monthly]
+        display_name = benchmark_display_names.get(ticker, ticker)
+        color = benchmark_colors.get(ticker, colors["spy"])
+        bars = ax.bar(x + offset, bench_returns, width, 
+                     label=display_name, color=color)
+        benchmark_bars[ticker] = bars
+        offset += width
     
     # Color bars by positive/negative
-    for bar, val in zip(bars1, portfolio_returns):
+    for bar, val in zip(bars_portfolio, portfolio_returns):
         if val < 0:
             bar.set_alpha(0.7)
-    for bar, val in zip(bars2, spy_returns):
-        if val < 0:
-            bar.set_alpha(0.7)
+    for ticker, bars in benchmark_bars.items():
+        col_name = f"{ticker}_return" if ticker != "SPY" or f"{ticker}_return" in monthly[0] else "spy_return"
+        bench_returns = [m.get(col_name, 0) * 100 for m in monthly]
+        for bar, val in zip(bars, bench_returns):
+            if val < 0:
+                bar.set_alpha(0.7)
     
     ax.set_title("Monthly Returns Comparison", fontsize=14, fontweight="bold", pad=20)
     ax.set_xlabel("Month", fontsize=11)
@@ -418,9 +569,34 @@ def generate_summary_dashboard(results: dict, metrics: dict, colors: dict, outpu
     # 1. Equity Curve (top, spans 2 columns)
     ax1 = fig.add_subplot(gs[0, :2])
     portfolio_equity = [100000 * c for c in metrics["portfolio_cumulative"]]
-    spy_equity = [100000 * c for c in metrics["spy_cumulative"][:len(dates)]]
     ax1.plot(dates, portfolio_equity, label="ML Strategy", color=colors["portfolio"], linewidth=2)
-    ax1.plot(dates[:len(spy_equity)], spy_equity, label="S&P 500", color=colors["spy"], linewidth=2, linestyle="--")
+    
+    # Plot all benchmarks
+    benchmark_colors = {
+        "SPY": colors["spy"],
+        "DIA": "#FFA500",
+        "QQQ": "#00CED1",
+    }
+    linestyles = ["--", "-.", ":"]
+    benchmark_cumulative = metrics.get("benchmark_cumulative", {})
+    benchmark_display_names = metrics.get("benchmark_display_names", {})
+    
+    # Fallback to spy_cumulative for backward compatibility
+    if not benchmark_cumulative and "spy_cumulative" in metrics:
+        spy_cumulative = metrics["spy_cumulative"]
+        if spy_cumulative:
+            benchmark_cumulative["SPY"] = spy_cumulative
+            benchmark_display_names["SPY"] = "S&P 500"
+    
+    for i, (ticker, cumulative) in enumerate(benchmark_cumulative.items()):
+        if cumulative:
+            equity = [100000 * c for c in cumulative[:len(dates)]]
+            display_name = benchmark_display_names.get(ticker, ticker)
+            color = benchmark_colors.get(ticker, colors["spy"])
+            linestyle = linestyles[i % len(linestyles)]
+            ax1.plot(dates[:len(equity)], equity, 
+                    label=display_name, color=color, linewidth=2, linestyle=linestyle)
+    
     ax1.fill_between(dates, portfolio_equity, alpha=0.1, color=colors["portfolio"])
     ax1.set_title("Equity Curve", fontsize=12, fontweight="bold")
     ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f"${x/1000:.0f}k"))
@@ -490,11 +666,41 @@ def generate_summary_dashboard(results: dict, metrics: dict, colors: dict, outpu
     if len(monthly) >= 2:
         months = [m["month_str"] for m in monthly]
         portfolio_monthly = [m["return"] * 100 for m in monthly]
-        spy_monthly = [m["spy_return"] * 100 for m in monthly]
+        
+        # Get available benchmarks
+        available_benchmarks = []
+        for ticker in ["SPY", "DIA", "QQQ"]:
+            col_name = f"{ticker}_return"
+            if col_name in monthly[0]:
+                available_benchmarks.append(ticker)
+        
+        # Fallback to spy_return
+        if not available_benchmarks and "spy_return" in monthly[0]:
+            available_benchmarks = ["SPY"]
+        
         x = np.arange(len(months))
-        width = 0.35
-        ax6.bar(x - width/2, portfolio_monthly, width, label="ML Strategy", color=colors["portfolio"])
-        ax6.bar(x + width/2, spy_monthly, width, label="S&P 500", color=colors["spy"])
+        n_bars = 1 + len(available_benchmarks)
+        width = 0.8 / n_bars
+        
+        offset = -(n_bars - 1) * width / 2
+        ax6.bar(x + offset, portfolio_monthly, width, label="ML Strategy", color=colors["portfolio"])
+        offset += width
+        
+        benchmark_colors = {
+            "SPY": colors["spy"],
+            "DIA": "#FFA500",
+            "QQQ": "#00CED1",
+        }
+        benchmark_display_names = metrics.get("benchmark_display_names", {})
+        
+        for ticker in available_benchmarks:
+            col_name = f"{ticker}_return" if ticker != "SPY" or f"{ticker}_return" in monthly[0] else "spy_return"
+            bench_monthly = [m.get(col_name, 0) * 100 for m in monthly]
+            display_name = benchmark_display_names.get(ticker, ticker)
+            color = benchmark_colors.get(ticker, colors["spy"])
+            ax6.bar(x + offset, bench_monthly, width, label=display_name, color=color)
+            offset += width
+        
         ax6.set_xticks(x)
         ax6.set_xticklabels(months, rotation=45, ha="right")
         ax6.axhline(y=0, color=colors["neutral"], linestyle="-", linewidth=0.5)
@@ -532,13 +738,50 @@ def generate_text_summary(results: dict, metrics: dict) -> str:
     lines.append("-" * 80)
     lines.append("PERFORMANCE METRICS")
     lines.append("-" * 80)
-    lines.append(f"{'Metric':<30} {'ML Strategy':>15} {'S&P 500':>15} {'Difference':>15}")
+    
+    # Get benchmark returns from summary
+    benchmark_returns_pct = summary.get('benchmark_returns_pct', {})
+    benchmark_display_names = metrics.get("benchmark_display_names", {})
+    
+    # Backward compatibility: use spy_return_pct if benchmark_returns_pct not available
+    if not benchmark_returns_pct and 'spy_return_pct' in summary:
+        benchmark_returns_pct = {'SPY': summary['spy_return_pct']}
+        benchmark_display_names = {'SPY': 'S&P 500'}
+    
+    # Build header with benchmark columns
+    header_cols = ['Metric', 'ML Strategy']
+    for ticker in ['SPY', 'DIA', 'QQQ']:
+        if ticker in benchmark_returns_pct:
+            display_name = benchmark_display_names.get(ticker, ticker)
+            header_cols.append(display_name)
+    
+    # Print header
+    header_line = f"{header_cols[0]:<30}"
+    for col in header_cols[1:]:
+        header_line += f" {col:>15}"
+    lines.append(header_line)
     lines.append("-" * 80)
-    lines.append(f"{'Total Return':<30} {summary['total_return_pct']:>+14.2f}% {summary['spy_return_pct']:>+14.2f}% {summary['alpha_pct']:>+14.2f}%")
-    lines.append(f"{'Annualized Volatility':<30} {summary['annualized_volatility_pct']:>14.2f}% {'-':>15} {'-':>15}")
-    lines.append(f"{'Sharpe Ratio':<30} {summary['sharpe_ratio']:>15.2f} {'-':>15} {'-':>15}")
-    lines.append(f"{'Max Drawdown':<30} {summary['max_drawdown_pct']:>14.2f}% {'-':>15} {'-':>15}")
-    lines.append(f"{'Win Rate':<30} {summary['win_rate_pct']:>14.1f}% {'-':>15} {'-':>15}")
+    
+    # Total Return row
+    return_line = f"{'Total Return':<30} {summary['total_return_pct']:>+14.2f}%"
+    for ticker in ['SPY', 'DIA', 'QQQ']:
+        if ticker in benchmark_returns_pct:
+            return_line += f" {benchmark_returns_pct[ticker]:>+14.2f}%"
+    lines.append(return_line)
+    
+    # Alpha row (vs primary benchmark)
+    if summary.get('alpha_pct') is not None:
+        alpha_line = f"{'Alpha (vs Primary)':<30} {summary['alpha_pct']:>+14.2f}%"
+        for ticker in ['SPY', 'DIA', 'QQQ']:
+            if ticker in benchmark_returns_pct:
+                alpha_vs_bench = (summary['total_return_pct'] - benchmark_returns_pct[ticker])
+                alpha_line += f" {alpha_vs_bench:>+14.2f}%"
+        lines.append(alpha_line)
+    
+    lines.append(f"{'Annualized Volatility':<30} {summary['annualized_volatility_pct']:>14.2f}%")
+    lines.append(f"{'Sharpe Ratio':<30} {summary['sharpe_ratio']:>15.2f}")
+    lines.append(f"{'Max Drawdown':<30} {summary['max_drawdown_pct']:>14.2f}%")
+    lines.append(f"{'Win Rate':<30} {summary['win_rate_pct']:>14.1f}%")
     lines.append("")
     
     # Best/Worst days
@@ -574,12 +817,32 @@ def generate_text_summary(results: dict, metrics: dict) -> str:
         lines.append("-" * 80)
         lines.append("MONTHLY RETURNS")
         lines.append("-" * 80)
-        lines.append(f"{'Month':<15} {'ML Strategy':>15} {'S&P 500':>15} {'Alpha':>15}")
-        lines.append("-" * 60)
+        
+        # Build header
+        monthly_header = f"{'Month':<15} {'ML Strategy':>15}"
+        available_benchmarks = []
+        for ticker in ['SPY', 'DIA', 'QQQ']:
+            col_name = f"{ticker}_return"
+            if col_name in metrics["monthly_returns"][0]:
+                available_benchmarks.append(ticker)
+                display_name = benchmark_display_names.get(ticker, ticker)
+                monthly_header += f" {display_name:>15}"
+        
+        # Fallback to spy_return
+        if not available_benchmarks and "spy_return" in metrics["monthly_returns"][0]:
+            available_benchmarks = ["SPY"]
+            monthly_header += f" {'S&P 500':>15}"
+        
+        lines.append(monthly_header)
+        lines.append("-" * (15 + 15 * (1 + len(available_benchmarks))))
         
         for m in metrics["monthly_returns"]:
-            alpha = (m["return"] - m["spy_return"]) * 100
-            lines.append(f"{m['month_str']:<15} {m['return']*100:>+14.2f}% {m['spy_return']*100:>+14.2f}% {alpha:>+14.2f}%")
+            month_line = f"{m['month_str']:<15} {m['return']*100:>+14.2f}%"
+            for ticker in available_benchmarks:
+                col_name = f"{ticker}_return" if ticker != "SPY" or f"{ticker}_return" in m else "spy_return"
+                bench_return = m.get(col_name, 0) * 100
+                month_line += f" {bench_return:>+14.2f}%"
+            lines.append(month_line)
         lines.append("")
     
     lines.append("=" * 80)

@@ -904,12 +904,14 @@ def main():
     parser.add_argument("--end-date", type=str, required=True, help="Backtest end date (YYYY-MM-DD)")
     parser.add_argument("--symbols", type=str, nargs="+", help="Symbols to backtest (default: all in database)")
     parser.add_argument("--train-start", type=str, help="Training start date (default: same as start-date)")
-    parser.add_argument("--train-end", type=str, help="Training end date (default: 80% of backtest period)")
+    parser.add_argument("--train-end", type=str, help="Training end date (default: 80%% of backtest period)")
     parser.add_argument("--model", type=str, default="xgboost", choices=["xgboost", "lightgbm"], help="Model type")
     parser.add_argument("--horizon", type=int, default=20, help="Primary prediction horizon (days)")
     parser.add_argument("--top-k", type=int, default=3, help="Number of top assets to hold")
     parser.add_argument("--initial-capital", type=float, default=100000.0, help="Initial capital")
     parser.add_argument("--run-benchmarks", action="store_true", help="Run benchmark strategies for comparison")
+    parser.add_argument("--benchmark", type=str, help="Single benchmark to use (e.g., 'sp500', 'dow', 'nasdaq', or ticker like 'SPY')")
+    parser.add_argument("--benchmarks", type=str, help="Comma-separated list of benchmarks (e.g., 'sp500,dow,nasdaq' or 'SPY,QQQ')")
     parser.add_argument("--random-portfolio-runs", type=int, default=0, help="Number of random portfolio runs for distribution (0 to skip)")
     parser.add_argument("--cost-sensitivity", action="store_true", help="Run cost sensitivity analysis at different cost levels")
     parser.add_argument("--cost-levels", type=float, nargs="+", default=[0, 5, 10, 20], help="Cost levels in bps per side (default: 0 5 10 20)")
@@ -1240,45 +1242,83 @@ def main():
         logger.info("Running benchmark strategies...")
         benchmarks = BenchmarkStrategies(backtester)
         
-        # SPY buy-and-hold
-        try:
-            # Check if SPY is in prices_df (via symbol column or by querying)
-            spy_found = False
-            if 'symbol' in prices_df.columns:
-                spy_found = len(prices_df[prices_df['symbol'] == 'SPY']) > 0
-            
-            if not spy_found:
-                # Try to add SPY to prices_df if it exists in database
-                spy_df = storage.query("SELECT asset_id FROM assets WHERE symbol = 'SPY'")
-                if len(spy_df) > 0:
-                    spy_asset_id = spy_df['asset_id'].iloc[0]
-                    # Get SPY bars
-                    spy_bars = api.get_bars_asof(end_date, universe={spy_asset_id})
-                    if len(spy_bars) > 0:
-                        spy_bars['date'] = pd.to_datetime(spy_bars['date']).dt.date
-                        spy_bars = spy_bars[
-                            (spy_bars['date'] >= start_date) & 
-                            (spy_bars['date'] <= end_date)
-                        ]
-                        if len(spy_bars) > 0:
-                            spy_bars['symbol'] = 'SPY'
-                            # Merge with prices_df
-                            prices_df = pd.concat([prices_df, spy_bars[['date', 'asset_id', 'adj_close', 'symbol']]], ignore_index=True)
-                            spy_found = True
-            
-            if spy_found:
-                spy_equity = benchmarks.buy_and_hold(prices_df, symbol="SPY")
-                spy_metrics = PerformanceMetrics.compute_metrics(spy_equity)
-                all_results['spy_buy_and_hold'] = {
-                    'name': 'SPY Buy and Hold',
-                    'equity_curve': spy_equity,
-                    'metrics': spy_metrics
-                }
-                logger.info("SPY buy-and-hold benchmark complete")
+        # Determine which benchmarks to run
+        benchmark_symbols = []
+        benchmark_config = getattr(config, 'benchmarks', {})
+        benchmark_definitions = benchmark_config.get('definitions', {})
+        default_benchmarks = benchmark_config.get('default', ['sp500'])
+        
+        if args.benchmark:
+            # Single benchmark specified
+            if args.benchmark in benchmark_definitions:
+                ticker = benchmark_definitions[args.benchmark]['ticker']
+                benchmark_symbols = [ticker]
             else:
-                logger.warning("SPY not found in database or prices, skipping buy-and-hold benchmark")
-        except Exception as e:
-            logger.warning(f"Failed to run SPY buy-and-hold benchmark: {e}")
+                # Assume it's a ticker symbol directly
+                benchmark_symbols = [args.benchmark.upper()]
+        elif args.benchmarks:
+            # Multiple benchmarks specified
+            bench_names = [b.strip() for b in args.benchmarks.split(',')]
+            for bench_name in bench_names:
+                if bench_name in benchmark_definitions:
+                    ticker = benchmark_definitions[bench_name]['ticker']
+                    benchmark_symbols.append(ticker)
+                else:
+                    # Assume it's a ticker symbol directly
+                    benchmark_symbols.append(bench_name.upper())
+        else:
+            # Use defaults from config
+            for bench_name in default_benchmarks:
+                if bench_name in benchmark_definitions:
+                    ticker = benchmark_definitions[bench_name]['ticker']
+                    benchmark_symbols.append(ticker)
+        
+        # Fallback to SPY if no benchmarks configured
+        if not benchmark_symbols:
+            benchmark_symbols = ['SPY']
+        
+        logger.info(f"Running benchmarks: {benchmark_symbols}")
+        
+        # Add benchmark symbols to prices_df if not present
+        for symbol in benchmark_symbols:
+            if 'symbol' not in prices_df.columns or len(prices_df[prices_df.get('symbol') == symbol]) == 0:
+                # Try to add benchmark to prices_df
+                symbol_df = storage.query(f"SELECT asset_id FROM assets WHERE symbol = '{symbol}'")
+                if len(symbol_df) > 0:
+                    asset_id = symbol_df['asset_id'].iloc[0]
+                    # Get bars for this benchmark
+                    bench_bars = api.get_bars_asof(end_date, universe={asset_id})
+                    if len(bench_bars) > 0:
+                        bench_bars['date'] = pd.to_datetime(bench_bars['date']).dt.date
+                        bench_bars = bench_bars[
+                            (bench_bars['date'] >= start_date) & 
+                            (bench_bars['date'] <= end_date)
+                        ]
+                        if len(bench_bars) > 0:
+                            bench_bars['symbol'] = symbol
+                            # Merge with prices_df
+                            prices_df = pd.concat([prices_df, bench_bars[['date', 'asset_id', 'adj_close', 'symbol']]], ignore_index=True)
+        
+        # Run all benchmarks
+        benchmark_results = benchmarks.run_benchmarks(prices_df, benchmark_symbols)
+        
+        for symbol, equity_curve in benchmark_results.items():
+            try:
+                metrics = PerformanceMetrics.compute_metrics(equity_curve)
+                display_name = benchmark_definitions.get(
+                    next((k for k, v in benchmark_definitions.items() if v['ticker'] == symbol), None),
+                    {}
+                ).get('name', symbol)
+                
+                result_key = f"{symbol.lower()}_buy_and_hold"
+                all_results[result_key] = {
+                    'name': f'{display_name} ({symbol}) Buy and Hold',
+                    'equity_curve': equity_curve,
+                    'metrics': metrics
+                }
+                logger.info(f"{symbol} buy-and-hold benchmark complete")
+            except Exception as e:
+                logger.warning(f"Failed to process {symbol} benchmark: {e}")
         
         # Equal-weight universe
         try:
@@ -1382,8 +1422,9 @@ def main():
             'Calmar': metrics['calmar_ratio']
         })
         
-        for key in ['spy_buy_and_hold', 'equal_weight_universe']:
-            if key in all_results:
+        # Add all benchmark results (buy-and-hold benchmarks)
+        for key in sorted(all_results.keys()):
+            if key.endswith('_buy_and_hold') or key == 'equal_weight_universe':
                 bm = all_results[key]
                 comparison_data.append({
                     'Strategy': bm['name'],
@@ -1579,8 +1620,8 @@ def main():
     
     # Save benchmark equity curves
     if args.run_benchmarks:
-        for key in ['spy_buy_and_hold', 'equal_weight_universe']:
-            if key in all_results:
+        for key in sorted(all_results.keys()):
+            if (key.endswith('_buy_and_hold') or key == 'equal_weight_universe') and key in all_results:
                 bm = all_results[key]
                 safe_name = bm['name'].lower().replace(' ', '_').replace('(', '').replace(')', '')
                 bm['equity_curve'].to_csv(output_path / f"equity_curve_{safe_name}.csv", index=False)

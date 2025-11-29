@@ -2,7 +2,7 @@
 
 import pandas as pd
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import date
 from backtest.vectorized import VectorizedBacktester
 
@@ -167,4 +167,29 @@ class BenchmarkStrategies:
             all_results.append(equity_curve)
         
         return pd.concat(all_results, ignore_index=True)
+    
+    def run_benchmarks(
+        self,
+        prices_df: pd.DataFrame,
+        symbols: List[str]
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Run buy-and-hold benchmarks for multiple symbols.
+        
+        Args:
+            prices_df: DataFrame with columns: date, asset_id, adj_close (and optionally symbol)
+            symbols: List of ticker symbols to benchmark
+        
+        Returns:
+            Dictionary mapping symbol -> equity curve DataFrame
+        """
+        results = {}
+        for symbol in symbols:
+            try:
+                equity_curve = self.buy_and_hold(prices_df, symbol=symbol)
+                results[symbol] = equity_curve
+            except Exception as e:
+                # Skip if symbol not found or error
+                continue
+        return results
 

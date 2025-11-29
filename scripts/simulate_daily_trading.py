@@ -374,9 +374,37 @@ class DailyTradingSimulator:
         for _, row in price_data.iterrows():
             price_lookup[(row['date'], row['asset_id'])] = row['close']
         
-        # Get SPY asset_id
-        spy_result = self.storage.query("SELECT asset_id FROM assets WHERE symbol = 'SPY'")
-        spy_asset_id = spy_result.iloc[0]['asset_id'] if len(spy_result) > 0 else None
+        # Get benchmark symbols from config (default to SPY, DIA, QQQ)
+        from configs.loader import get_config
+        config = get_config()
+        benchmark_config = getattr(config, 'benchmarks', {})
+        benchmark_definitions = benchmark_config.get('definitions', {})
+        default_benchmarks = benchmark_config.get('default', ['sp500'])
+        
+        # Map benchmark names to tickers
+        benchmark_symbols = []
+        benchmark_names = {}
+        for bench_name in default_benchmarks:
+            if bench_name in benchmark_definitions:
+                ticker = benchmark_definitions[bench_name]['ticker']
+                name = benchmark_definitions[bench_name]['name']
+                benchmark_symbols.append(ticker)
+                benchmark_names[ticker] = name
+        
+        # Fallback to SPY if no benchmarks configured
+        if not benchmark_symbols:
+            benchmark_symbols = ['SPY']
+            benchmark_names['SPY'] = 'S&P 500'
+        
+        # Get asset_ids for all benchmarks
+        benchmark_asset_ids = {}
+        for symbol in benchmark_symbols:
+            result = self.storage.query(f"SELECT asset_id FROM assets WHERE symbol = '{symbol}'")
+            if len(result) > 0:
+                benchmark_asset_ids[symbol] = result.iloc[0]['asset_id']
+        
+        # Backward compatibility: keep SPY asset_id for spy_return
+        spy_asset_id = benchmark_asset_ids.get('SPY', None)
         
         # Simulation state
         portfolio_value = self.initial_capital
@@ -429,13 +457,19 @@ class DailyTradingSimulator:
             # Update portfolio value
             portfolio_value *= (1 + day_return)
             
-            # Get SPY return for comparison
-            spy_return = None
-            if spy_asset_id:
-                spy_today = price_lookup.get((trading_date, spy_asset_id))
-                spy_tomorrow = price_lookup.get((next_date, spy_asset_id))
-                if spy_today and spy_tomorrow:
-                    spy_return = (spy_tomorrow - spy_today) / spy_today
+            # Get benchmark returns for comparison
+            benchmark_returns = {}
+            spy_return = None  # Backward compatibility
+            
+            for symbol, asset_id in benchmark_asset_ids.items():
+                today_price = price_lookup.get((trading_date, asset_id))
+                tomorrow_price = price_lookup.get((next_date, asset_id))
+                if today_price and tomorrow_price:
+                    ret = (tomorrow_price - today_price) / today_price
+                    benchmark_returns[symbol] = ret
+                    # Keep SPY return for backward compatibility
+                    if symbol == 'SPY':
+                        spy_return = ret
             
             # Record results
             daily_results.append({
@@ -444,7 +478,8 @@ class DailyTradingSimulator:
                 "positions": position_returns,
                 "portfolio_return": day_return,
                 "portfolio_value": portfolio_value,
-                "spy_return": spy_return,
+                "spy_return": spy_return,  # Backward compatibility
+                "benchmark_returns": benchmark_returns,  # New multi-benchmark support
                 "cumulative_return": (portfolio_value - self.initial_capital) / self.initial_capital
             })
             
@@ -458,10 +493,18 @@ class DailyTradingSimulator:
         # Calculate summary statistics
         total_return = (portfolio_value - self.initial_capital) / self.initial_capital
         
-        # SPY total return
-        spy_start = price_lookup.get((trading_days[0], spy_asset_id))
-        spy_end = price_lookup.get((trading_days[-1], spy_asset_id))
-        spy_total_return = (spy_end - spy_start) / spy_start if spy_start and spy_end else None
+        # Calculate benchmark total returns
+        benchmark_total_returns = {}
+        spy_total_return = None  # Backward compatibility
+        
+        for symbol, asset_id in benchmark_asset_ids.items():
+            start_price = price_lookup.get((trading_days[0], asset_id))
+            end_price = price_lookup.get((trading_days[-1], asset_id))
+            if start_price and end_price:
+                bench_return = (end_price - start_price) / start_price
+                benchmark_total_returns[symbol] = bench_return
+                if symbol == 'SPY':
+                    spy_total_return = bench_return
         
         # Calculate additional metrics
         daily_returns = [r["portfolio_return"] for r in daily_results]
@@ -480,6 +523,12 @@ class DailyTradingSimulator:
         wins = sum(1 for r in daily_returns if r > 0)
         win_rate = wins / len(daily_returns) if daily_returns else 0
         
+        # Calculate alpha vs primary benchmark (SPY by default)
+        primary_benchmark = benchmark_config.get('primary', 'sp500')
+        primary_ticker = benchmark_definitions.get(primary_benchmark, {}).get('ticker', 'SPY')
+        primary_return = benchmark_total_returns.get(primary_ticker, spy_total_return)
+        alpha_pct = (total_return - primary_return) * 100 if primary_return else None
+        
         return {
             "summary": {
                 "start_date": str(trading_days[0]),
@@ -490,8 +539,9 @@ class DailyTradingSimulator:
                 "initial_capital": self.initial_capital,
                 "final_value": portfolio_value,
                 "total_return_pct": total_return * 100,
-                "spy_return_pct": spy_total_return * 100 if spy_total_return else None,
-                "alpha_pct": (total_return - spy_total_return) * 100 if spy_total_return else None,
+                "spy_return_pct": spy_total_return * 100 if spy_total_return else None,  # Backward compatibility
+                "benchmark_returns_pct": {k: v * 100 for k, v in benchmark_total_returns.items()},  # New
+                "alpha_pct": alpha_pct,
                 "annualized_volatility_pct": volatility * 100,
                 "sharpe_ratio": sharpe,
                 "max_drawdown_pct": max_drawdown * 100,

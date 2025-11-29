@@ -53,6 +53,7 @@ class Config(BaseModel):
     live: Dict[str, Any] = Field(default_factory=dict)
     live_gates: Dict[str, Any] = Field(default_factory=dict)
     logging: Dict[str, Any] = Field(default_factory=dict)
+    benchmarks: Dict[str, Any] = Field(default_factory=dict)
 
 
 def load_config(config_path: str = "configs/base.yaml") -> Config:

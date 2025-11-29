@@ -44,7 +44,11 @@ class DataCoverageChecker:
                 FROM bars_daily
             """)
             
-            if len(result) == 0 or result['max_date'].iloc[0] is None:
+            total_bars = int(result['total_bars'].iloc[0]) if result['total_bars'].iloc[0] is not None else 0
+            num_assets = int(result['num_assets'].iloc[0]) if result['num_assets'].iloc[0] is not None else 0
+            
+            # Check if we actually have data (not just an empty table)
+            if total_bars == 0 or result['max_date'].iloc[0] is None:
                 return {
                     'min_date': None,
                     'max_date': None,
@@ -65,8 +69,8 @@ class DataCoverageChecker:
             return {
                 'min_date': min_date,
                 'max_date': max_date,
-                'total_bars': int(result['total_bars'].iloc[0]),
-                'num_assets': int(result['num_assets'].iloc[0]),
+                'total_bars': total_bars,
+                'num_assets': num_assets,
                 'has_data': True
             }
         except Exception as e:
@@ -349,7 +353,7 @@ class DataMaintenanceManager:
             return datetime.strptime(date_val, "%Y-%m-%d").date()
         return date_val
     
-    def get_symbols_from_config(self, include_universe: bool = True) -> List[str]:
+    def get_symbols_from_config(self, include_universe: bool = True, include_benchmarks: bool = True) -> List[str]:
         """
         Get list of symbols from config, universe membership, CSV, or database.
         
@@ -359,63 +363,97 @@ class DataMaintenanceManager:
         3. Universe constituents CSV file (bootstrap case - empty DB)
         4. All symbols with price data in bars_daily
         
+        Additionally, benchmark symbols (SPY, DIA, QQQ) are always included when
+        include_benchmarks=True to ensure they're available for comparison.
+        
         Args:
             include_universe: If True, include symbols from universe_membership table or CSV
+            include_benchmarks: If True, include benchmark symbols from config
         """
+        symbols = []
+        
         # Check for config-specified symbols
         data_config = self._get_config_section('data', {})
-        symbols = self._get_from_config(data_config, 'symbols', [])
-        if symbols:
-            return symbols
-        
-        # Try universe membership (survivorship-bias-free S&P 500 or other index)
-        if include_universe:
-            try:
-                universe_config = self._get_config_section('universe', {})
-                index_name = self._get_from_config(universe_config, 'index_name', 'SP500')
+        config_symbols = self._get_from_config(data_config, 'symbols', [])
+        if config_symbols:
+            symbols = list(config_symbols)
+        else:
+            # Try universe membership (survivorship-bias-free S&P 500 or other index)
+            if include_universe:
+                try:
+                    universe_config = self._get_config_section('universe', {})
+                    index_name = self._get_from_config(universe_config, 'index_name', 'SP500')
+                    
+                    universe_df = self.storage.query(f"""
+                        SELECT DISTINCT a.symbol
+                        FROM universe_membership um
+                        JOIN assets a ON um.asset_id = a.asset_id
+                        WHERE um.index_name = '{index_name}'
+                        ORDER BY a.symbol
+                    """)
+                    if len(universe_df) > 0:
+                        symbols = universe_df['symbol'].tolist()
+                except Exception:
+                    pass
                 
-                universe_df = self.storage.query(f"""
-                    SELECT DISTINCT a.symbol
-                    FROM universe_membership um
-                    JOIN assets a ON um.asset_id = a.asset_id
-                    WHERE um.index_name = '{index_name}'
-                    ORDER BY a.symbol
-                """)
-                if len(universe_df) > 0:
-                    return universe_df['symbol'].tolist()
-            except Exception:
-                pass
+                # Bootstrap case: If universe_membership is empty, read directly from CSV
+                if not symbols:
+                    try:
+                        universe_config = self._get_config_section('universe', {})
+                        csv_path = self._get_from_config(universe_config, 'constituents_csv_path', 'data/sp500_constituents.csv')
+                        
+                        if Path(csv_path).exists():
+                            import pandas as pd
+                            constituents_df = pd.read_csv(csv_path)
+                            if 'symbol' in constituents_df.columns:
+                                symbols_from_csv = constituents_df['symbol'].unique().tolist()
+                                if symbols_from_csv:
+                                    logger.info(f"Bootstrapping from {csv_path}: {len(symbols_from_csv)} symbols")
+                                    symbols = symbols_from_csv
+                    except Exception as e:
+                        logger.debug(f"Could not read constituents CSV: {e}")
             
-            # Bootstrap case: If universe_membership is empty, read directly from CSV
-            try:
-                universe_config = self._get_config_section('universe', {})
-                csv_path = self._get_from_config(universe_config, 'constituents_csv_path', 'data/sp500_constituents.csv')
-                
-                if Path(csv_path).exists():
-                    import pandas as pd
-                    constituents_df = pd.read_csv(csv_path)
-                    if 'symbol' in constituents_df.columns:
-                        symbols_from_csv = constituents_df['symbol'].unique().tolist()
-                        if symbols_from_csv:
-                            logger.info(f"Bootstrapping from {csv_path}: {len(symbols_from_csv)} symbols")
-                            return symbols_from_csv
-            except Exception as e:
-                logger.debug(f"Could not read constituents CSV: {e}")
+            # Fall back to symbols that have price data
+            if not symbols:
+                try:
+                    symbols_df = self.storage.query("""
+                        SELECT DISTINCT a.symbol 
+                        FROM assets a
+                        JOIN bars_daily bd ON a.asset_id = bd.asset_id
+                        ORDER BY a.symbol
+                    """)
+                    if len(symbols_df) > 0:
+                        symbols = symbols_df['symbol'].tolist()
+                except Exception:
+                    pass
         
-        # Fall back to symbols that have price data
-        try:
-            symbols_df = self.storage.query("""
-                SELECT DISTINCT a.symbol 
-                FROM assets a
-                JOIN bars_daily bd ON a.asset_id = bd.asset_id
-                ORDER BY a.symbol
-            """)
-            if len(symbols_df) > 0:
-                return symbols_df['symbol'].tolist()
-        except Exception:
-            pass
+        # Always include benchmark symbols for comparison
+        if include_benchmarks:
+            benchmark_symbols = self._get_benchmark_symbols()
+            for sym in benchmark_symbols:
+                if sym not in symbols:
+                    symbols.append(sym)
         
-        return []
+        return symbols
+    
+    def _get_benchmark_symbols(self) -> List[str]:
+        """Get benchmark ticker symbols from config."""
+        benchmark_config = self._get_config_section('benchmarks', {})
+        definitions = self._get_from_config(benchmark_config, 'definitions', {})
+        default_benchmarks = self._get_from_config(benchmark_config, 'default', ['sp500'])
+        
+        benchmark_symbols = []
+        for bench_name in default_benchmarks:
+            if bench_name in definitions:
+                ticker = definitions[bench_name].get('ticker')
+                if ticker:
+                    benchmark_symbols.append(ticker)
+        
+        # Fallback to SPY if no benchmarks configured
+        if not benchmark_symbols:
+            benchmark_symbols = ['SPY']
+        
+        return benchmark_symbols
     
     def ensure_coverage(
         self,
@@ -567,6 +605,47 @@ class DataMaintenanceManager:
         elif total_bars > 0:
             result['status'] = 'partial'
             result['message'] = f"Fetched {total_bars} bars with {total_errors} errors"
+        elif mode == 'daily-top-up' and len(gaps.get('missing_symbols', [])) == 0:
+            # For daily top-up, if we have no missing symbols (just date gaps),
+            # and we couldn't fetch data, it's likely because:
+            # 1. Today is a holiday or weekend
+            # 2. Market hasn't closed yet
+            # 3. Data isn't available yet from the vendor
+            # In these cases, check if we have reasonably recent data
+            coverage_after = self.checker.get_current_coverage()
+            if coverage_after['has_data']:
+                from data.universe import TradingCalendar
+                calendar = TradingCalendar()
+                today = date.today()
+                
+                # Find the last expected trading day (could be today if market closed, or previous day)
+                try:
+                    # If today is not a trading day, get previous
+                    if not calendar.is_trading_day(today):
+                        last_expected = calendar.previous_trading_day(today)
+                    else:
+                        # If today is a trading day, data might not be available yet
+                        # Accept data from yesterday or today
+                        last_expected = calendar.previous_trading_day(today)
+                    
+                    days_stale = (last_expected - coverage_after['max_date']).days if coverage_after['max_date'] else 999
+                    
+                    if days_stale <= 1:
+                        # Data is fresh enough (within 1 trading day)
+                        result['status'] = 'ok'
+                        result['message'] = f"Data is current (last: {coverage_after['max_date']}, expected: {last_expected})"
+                        logger.info(result['message'])
+                    else:
+                        result['status'] = 'warning'
+                        result['message'] = f"Data is {days_stale} days stale but continuing (last: {coverage_after['max_date']})"
+                        logger.warning(result['message'])
+                except Exception as e:
+                    logger.debug(f"Could not check data freshness: {e}")
+                    result['status'] = 'warning'
+                    result['message'] = f"Could not fetch new data but existing data available"
+            else:
+                result['status'] = 'error'
+                result['message'] = f"Failed to fetch data: {total_errors} errors"
         else:
             result['status'] = 'error'
             result['message'] = f"Failed to fetch data: {total_errors} errors"
@@ -614,6 +693,77 @@ class DataMaintenanceManager:
             
         except Exception as e:
             logger.warning(f"Failed to bootstrap universe_membership: {e}")
+    
+    def validate_data_sufficiency(self, min_days: int = 252) -> Dict[str, Any]:
+        """
+        Validate that we have sufficient data for trading.
+        
+        Args:
+            min_days: Minimum number of trading days required (default: 252, ~1 year)
+        
+        Returns:
+            Dict with validation results
+        """
+        coverage = self.checker.get_current_coverage()
+        
+        result = {
+            'is_sufficient': False,
+            'has_data': coverage['has_data'],
+            'total_bars': coverage['total_bars'],
+            'num_assets': coverage['num_assets'],
+            'min_date': coverage['min_date'],
+            'max_date': coverage['max_date'],
+            'issues': []
+        }
+        
+        if not coverage['has_data']:
+            result['issues'].append("No data in database - bootstrap required")
+            return result
+        
+        # Check number of assets
+        if coverage['num_assets'] < 10:
+            result['issues'].append(f"Only {coverage['num_assets']} assets - need at least 10")
+        
+        # Estimate trading days based on total bars and assets
+        if coverage['num_assets'] > 0:
+            avg_bars_per_asset = coverage['total_bars'] / coverage['num_assets']
+            if avg_bars_per_asset < min_days:
+                result['issues'].append(
+                    f"Average {avg_bars_per_asset:.0f} bars per asset - need at least {min_days}"
+                )
+        
+        # Check date range
+        if coverage['min_date'] and coverage['max_date']:
+            date_range_days = (coverage['max_date'] - coverage['min_date']).days
+            if date_range_days < min_days:
+                result['issues'].append(
+                    f"Date range is only {date_range_days} days - need at least {min_days}"
+                )
+        
+        # Check data freshness using proper trading calendar
+        if coverage['max_date']:
+            from data.universe import TradingCalendar
+            calendar = TradingCalendar()
+            today = date.today()
+            
+            # Get last trading day
+            try:
+                if not calendar.is_trading_day(today):
+                    last_trading_day = calendar.previous_trading_day(today)
+                else:
+                    last_trading_day = today
+                
+                days_stale = (last_trading_day - coverage['max_date']).days
+                
+                if days_stale > 5:
+                    result['issues'].append(
+                        f"Data is {days_stale} calendar days stale (last: {coverage['max_date']}, expected: {last_trading_day})"
+                    )
+            except Exception as e:
+                logger.debug(f"Could not check data freshness: {e}")
+        
+        result['is_sufficient'] = len(result['issues']) == 0
+        return result
     
     def get_coverage_report(self, universe: Optional[Set[int]] = None) -> Dict[str, Any]:
         """
@@ -691,4 +841,245 @@ def ensure_data_coverage(
         vendor=vendor,
         auto_fetch=auto_fetch
     )
+
+
+def prepare_for_trading(
+    storage: StorageBackend,
+    config: Optional[Dict[str, Any]] = None,
+    requested_date: Optional[date] = None,
+    lookback_days: int = 252,
+    train_days: int = 750,
+    auto_fetch: bool = True
+) -> Dict[str, Any]:
+    """
+    Comprehensive preparation for live/paper trading.
+    
+    This function handles all data validation and preparation needed before
+    running the trading loop. It:
+    1. Determines the correct trading date (handles holidays/weekends)
+    2. Validates sufficient historical data exists for features and training
+    3. Attempts to fetch missing data if auto_fetch is enabled
+    4. Returns the effective trading date and data readiness status
+    
+    This is the main entry point for the live loop to call.
+    
+    Args:
+        storage: StorageBackend instance
+        config: Config dict (if None, will use get_config())
+        requested_date: Date to trade on (if None, uses today or last trading day)
+        lookback_days: Days of history needed for feature generation (default: 252)
+        train_days: Days of history needed for model training (default: 750)
+        auto_fetch: If True, automatically fetch missing data
+    
+    Returns:
+        Dict with:
+            - ready: bool - whether trading can proceed
+            - trading_date: date - the effective date to use for trading
+            - data_date: date - the last date with available data
+            - issues: list - any issues that prevent trading
+            - warnings: list - non-fatal warnings
+            - coverage: dict - data coverage summary
+            - fetch_result: dict - result of any data fetch attempt
+    """
+    from data.universe import TradingCalendar
+    
+    if config is None:
+        from configs.loader import get_config
+        config = get_config().__dict__
+    
+    calendar = TradingCalendar()
+    today = date.today()
+    
+    result = {
+        'ready': False,
+        'trading_date': None,
+        'data_date': None,
+        'issues': [],
+        'warnings': [],
+        'coverage': None,
+        'fetch_result': None
+    }
+    
+    # Step 1: Determine the target trading date
+    if requested_date:
+        target_date = requested_date
+    else:
+        # Use today if it's a trading day, otherwise previous trading day
+        if calendar.is_trading_day(today):
+            target_date = today
+        else:
+            target_date = calendar.previous_trading_day(today)
+    
+    result['trading_date'] = target_date
+    logger.info(f"Target trading date: {target_date}")
+    
+    # Step 2: Check current data coverage
+    manager = DataMaintenanceManager(storage, config)
+    coverage = manager.checker.get_current_coverage()
+    result['coverage'] = coverage
+    
+    if not coverage['has_data']:
+        # No data at all - need full bootstrap
+        result['issues'].append("No data in database - full bootstrap required")
+        
+        if auto_fetch:
+            logger.info("Attempting full data bootstrap...")
+            fetch_result = manager.ensure_coverage(
+                mode="full-history",
+                target_end=target_date,
+                auto_fetch=True
+            )
+            result['fetch_result'] = fetch_result
+            
+            # Re-check coverage
+            coverage = manager.checker.get_current_coverage()
+            result['coverage'] = coverage
+            
+            if coverage['has_data']:
+                result['issues'] = []  # Clear the issue
+                logger.info("Bootstrap successful")
+            else:
+                result['issues'].append(f"Bootstrap failed: {fetch_result.get('message')}")
+                return result
+        else:
+            return result
+    
+    # Step 3: Determine the effective data date (last date with data)
+    data_date = coverage['max_date']
+    result['data_date'] = data_date
+    logger.info(f"Last data date: {data_date}")
+    
+    # Step 4: Check if data is fresh enough
+    # Get the last trading day before or on target_date
+    if target_date > today:
+        result['issues'].append(f"Cannot trade future date {target_date}")
+        return result
+    
+    # Find the expected data date (the most recent trading day for which data SHOULD be available)
+    # Key insight: We can only expect data for COMPLETED trading days
+    # - If today is a trading day, we might not have today's data yet (market still open or vendor delay)
+    # - We should expect data from the PREVIOUS completed trading day
+    
+    if target_date == today:
+        # For today, we expect data from the previous trading day (yesterday's close)
+        # This handles: market still open, vendor delays, early close days, etc.
+        yesterday = today - timedelta(days=1)
+        expected_data_date = calendar.previous_trading_day(yesterday)
+        if not calendar.is_trading_day(yesterday):
+            # yesterday wasn't a trading day, so previous_trading_day gives us the right date
+            pass
+        else:
+            # yesterday was a trading day, so that's what we expect
+            expected_data_date = yesterday
+        
+        logger.info(f"Trading on {target_date}, expecting data from previous trading day: {expected_data_date}")
+    elif calendar.is_trading_day(target_date):
+        # For a past trading day, we expect data from that day
+        expected_data_date = target_date
+    else:
+        # For a non-trading day, expect data from the previous trading day
+        expected_data_date = calendar.previous_trading_day(target_date)
+    
+    # Calculate staleness in TRADING days (not calendar days)
+    def count_trading_days_between(start_date: date, end_date: date) -> int:
+        """Count trading days between two dates (exclusive of start, inclusive of end)."""
+        if start_date >= end_date:
+            return 0
+        try:
+            trading_days = calendar.get_trading_days(start_date, end_date)
+            # Exclude start_date if it's in the list
+            return len([d for d in trading_days if d.date() > start_date])
+        except Exception:
+            # Fallback to calendar days
+            return (end_date - start_date).days
+    
+    if data_date < expected_data_date:
+        trading_days_stale = count_trading_days_between(data_date, expected_data_date)
+        calendar_days_stale = (expected_data_date - data_date).days
+        
+        if auto_fetch and trading_days_stale > 0:
+            logger.info(f"Data is {trading_days_stale} trading days stale ({calendar_days_stale} calendar days), attempting top-up...")
+            fetch_result = manager.ensure_coverage(
+                mode="daily-top-up",
+                target_end=target_date,
+                auto_fetch=True
+            )
+            result['fetch_result'] = fetch_result
+            
+            # Re-check coverage
+            coverage = manager.checker.get_current_coverage()
+            result['coverage'] = coverage
+            data_date = coverage['max_date']
+            result['data_date'] = data_date
+        
+        # Re-calculate staleness in trading days
+        trading_days_stale = count_trading_days_between(data_date, expected_data_date) if data_date else 999
+        
+        if trading_days_stale > 3:
+            # More than 3 trading days stale is a problem
+            result['issues'].append(
+                f"Data is {trading_days_stale} trading days stale (last: {data_date}, expected: {expected_data_date})"
+            )
+        elif trading_days_stale > 0:
+            # 1-3 trading days stale is a warning (could be vendor delay, market just closed, etc.)
+            result['warnings'].append(
+                f"Data is {trading_days_stale} trading days behind expected (last: {data_date}, expected: {expected_data_date}). "
+                f"This may be normal if market just closed or vendor has delay."
+            )
+            # Adjust trading date to use available data
+            result['trading_date'] = data_date
+            logger.info(f"Adjusted trading date to last available data: {data_date}")
+        else:
+            # trading_days_stale == 0 means data is current for the last completed trading day
+            # This can happen if expected_data_date is today but market hasn't closed yet
+            # or if there were holidays between data_date and expected_data_date
+            logger.info(f"Data is current (last: {data_date}, no trading days missed)")
+            result['trading_date'] = data_date
+    
+    # Step 5: Validate sufficient history for features and training
+    min_history_start = manager.min_history_start_date
+    
+    # Calculate required dates
+    required_feature_start = data_date - timedelta(days=int(lookback_days * 1.5))  # Buffer for weekends/holidays
+    required_train_start = data_date - timedelta(days=int(train_days * 1.5))
+    required_start = min(required_feature_start, required_train_start, min_history_start)
+    
+    # Allow a small tolerance (7 days) for the start date since:
+    # 1. min_history_start_date might be a holiday (e.g., 2020-01-01 is New Year's Day)
+    # 2. The first few days of data might have issues
+    # The important thing is having enough trading days of history
+    start_tolerance_days = 7
+    if coverage['min_date'] > required_start + timedelta(days=start_tolerance_days):
+        result['issues'].append(
+            f"Insufficient history: data starts {coverage['min_date']}, "
+            f"but need data from around {required_start} for {train_days}-day training + {lookback_days}-day lookback"
+        )
+    
+    # Step 6: Validate sufficient assets
+    if coverage['num_assets'] < 10:
+        result['issues'].append(f"Only {coverage['num_assets']} assets in database - need at least 10")
+    
+    # Step 7: Estimate if we have enough bars per asset
+    if coverage['num_assets'] > 0:
+        avg_bars = coverage['total_bars'] / coverage['num_assets']
+        min_required_bars = max(lookback_days, train_days // 5)  # Need at least lookback days per asset
+        
+        if avg_bars < min_required_bars:
+            result['warnings'].append(
+                f"Average {avg_bars:.0f} bars per asset may be insufficient "
+                f"(recommend at least {min_required_bars})"
+            )
+    
+    # Determine final readiness
+    result['ready'] = len(result['issues']) == 0
+    
+    if result['ready']:
+        logger.info(f"Data ready for trading on {result['trading_date']}")
+        if result['warnings']:
+            for warning in result['warnings']:
+                logger.warning(warning)
+    else:
+        logger.error(f"Data not ready for trading: {result['issues']}")
+    
+    return result
 

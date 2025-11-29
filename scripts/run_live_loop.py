@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.storage import StorageBackend
 from data.asof_api import AsOfQueryAPI
 from data.universe import TradingCalendar
-from data.maintenance import ensure_data_coverage
+from data.maintenance import ensure_data_coverage, prepare_for_trading
 from labels.returns import ReturnLabelGenerator
 from labels.regimes import RegimeLabelGenerator
 from features.pipeline import FeaturePipeline, RegimeFeatureBuilder
@@ -109,7 +109,8 @@ def load_or_train_model(
     universe: set,
     horizon: int = 20,
     train_days: int = 750,  # ~3 years
-    force_retrain: bool = False
+    force_retrain: bool = False,
+    expected_feature_count: int = None
 ) -> object:
     """
     Load model from disk or train a new one.
@@ -125,6 +126,7 @@ def load_or_train_model(
         horizon: Prediction horizon in days
         train_days: Number of days of training data
         force_retrain: If True, retrain even if model exists
+        expected_feature_count: If provided, validate model has this many features
     
     Returns:
         Trained model
@@ -142,8 +144,20 @@ def load_or_train_model(
                 retrain_frequency = config.live.get('retrain_frequency_days', 30) if hasattr(config, 'live') else 30
                 
                 if model_age_days <= retrain_frequency:
-                    logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
-                    return model_data['model']
+                    # Validate feature count if provided
+                    if expected_feature_count is not None:
+                        model_feature_count = model_data.get('feature_count')
+                        if model_feature_count and model_feature_count != expected_feature_count:
+                            logger.warning(
+                                f"Model feature count mismatch: model has {model_feature_count}, "
+                                f"but current features have {expected_feature_count}. Retraining..."
+                            )
+                        else:
+                            logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
+                            return model_data['model']
+                    else:
+                        logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
+                        return model_data['model']
                 else:
                     logger.info(f"Model is {model_age_days} days old, retraining...")
         except Exception as e:
@@ -247,6 +261,7 @@ def load_or_train_model(
         'model_type': model_type,
         'horizon': horizon,
         'feature_cols': list(X_train.columns),
+        'feature_count': len(X_train.columns),  # Store feature count for validation
         'training_samples': len(X_train),
         'config_hash': get_config_hash(dict(config.features)) if hasattr(config, 'features') else None
     }
@@ -294,6 +309,12 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Don't submit orders")
     parser.add_argument("--force-retrain", action="store_true", help="Force model retraining")
     parser.add_argument("--skip-if-logged", action="store_true", help="Skip if log already exists for date")
+    parser.add_argument("--force", action="store_true", 
+                       help="Force execution: bypass trading day check and idempotency. "
+                            "Use for testing or getting insights on weekends/holidays. "
+                            "Implies --dry-run unless --no-dry-run is also specified.")
+    parser.add_argument("--no-dry-run", action="store_true", 
+                       help="Actually submit orders even with --force (use with caution!)")
     
     # Broker selection
     parser.add_argument("--broker", type=str, default="paper", 
@@ -330,59 +351,116 @@ def main():
     if heartbeat_path:
         write_heartbeat(heartbeat_path, "starting")
     
-    # Determine trading date
-    calendar = TradingCalendar()
-    if args.trading_date:
-        trading_date = datetime.strptime(args.trading_date, "%Y-%m-%d").date()
-    else:
-        today = date.today()
-        try:
-            trading_date = calendar.previous_trading_day(today)
-        except Exception:
-            trading_date = today
-    
-    logger.info(f"{'='*60}")
-    logger.info(f"LIVE TRADING LOOP - {trading_date}")
-    logger.info(f"{'='*60}")
-    
-    # Check for existing log (idempotency)
-    log_dir = Path("logs") / "live_trading"
-    log_file = log_dir / f"daily_log_{trading_date}.json"
-    
-    if args.skip_if_logged and log_file.exists():
-        logger.info(f"Log already exists for {trading_date}, skipping (use --force to override)")
-        return
-    
-    # Initialize storage and API
+    # Initialize storage and config first
     config = get_config()
     storage = StorageBackend(
         db_path=config.database.duckdb_path,
         data_root=config.database.data_root
     )
-    api = AsOfQueryAPI(storage)
     
-    # Ensure data coverage (auto-fetch if enabled in config)
-    if config.data.auto_fetch_on_live:
-        logger.info("Checking data coverage (daily top-up)...")
-        coverage_result = ensure_data_coverage(
-            storage=storage,
-            config=config.__dict__,
-            mode="daily-top-up",
-            target_end=trading_date,  # Only check up to the trading date
-            auto_fetch=True
-        )
-        if coverage_result['status'] == 'error':
-            logger.error(f"Data coverage check failed: {coverage_result.get('message')}")
-            if args.enable_alerts and alert_manager:
-                alert_manager.send_error_alert(
-                    error_type="Data Coverage",
-                    error_message=coverage_result.get('message', 'Unknown error'),
-                    context={"trading_date": str(trading_date)}
-                )
-            storage.close()
-            return
-        elif coverage_result.get('gaps_identified'):
-            logger.info(f"Data coverage: {coverage_result.get('message')}")
+    # Determine requested trading date
+    calendar = TradingCalendar()
+    if args.trading_date:
+        requested_date = datetime.strptime(args.trading_date, "%Y-%m-%d").date()
+    else:
+        requested_date = None  # Let prepare_for_trading determine the best date
+    
+    # Comprehensive data preparation and validation
+    # This handles: bootstrap, top-up, date adjustment, and sufficiency validation
+    logger.info("Preparing data for trading...")
+    prep_result = prepare_for_trading(
+        storage=storage,
+        config=config.__dict__,
+        requested_date=requested_date,
+        lookback_days=252,  # Feature lookback
+        train_days=750,     # Training data requirement
+        auto_fetch=config.data.auto_fetch_on_live
+    )
+    
+    # Use the effective trading date from preparation
+    trading_date = prep_result['trading_date']
+    
+    logger.info(f"{'='*60}")
+    logger.info(f"LIVE TRADING LOOP - {trading_date}")
+    logger.info(f"{'='*60}")
+    
+    # Log any warnings
+    for warning in prep_result.get('warnings', []):
+        logger.warning(warning)
+    
+    # Check if data is ready
+    if not prep_result['ready']:
+        for issue in prep_result['issues']:
+            logger.error(f"Data issue: {issue}")
+        
+        if args.enable_alerts and alert_manager:
+            alert_manager.send_error_alert(
+                error_type="Data Preparation",
+                error_message="; ".join(prep_result['issues']),
+                context={
+                    "trading_date": str(trading_date),
+                    "coverage": prep_result.get('coverage'),
+                    "fetch_result": prep_result.get('fetch_result')
+                }
+            )
+        storage.close()
+        sys.exit(1)  # Exit with error code for cron/scheduler to detect
+    
+    logger.info(f"Data ready: {prep_result['coverage']['num_assets']} assets, "
+                f"data from {prep_result['coverage']['min_date']} to {prep_result['coverage']['max_date']}")
+    
+    # Handle --force flag
+    # When --force is used, we bypass safety checks for testing/insight purposes
+    force_mode = args.force
+    if force_mode:
+        # --force implies --dry-run unless --no-dry-run is explicitly set
+        if not args.no_dry_run:
+            args.dry_run = True
+            logger.warning("FORCE MODE: Running with --dry-run (use --no-dry-run to actually submit orders)")
+        else:
+            logger.warning("FORCE MODE: --no-dry-run specified, orders WILL be submitted!")
+    
+    # Check if today is a trading day - if not, skip execution
+    # This prevents duplicate orders when cron runs on weekends/holidays
+    calendar = TradingCalendar()
+    today = date.today()
+    
+    if not calendar.is_trading_day(today) and not force_mode:
+        # Today is not a trading day (weekend or holiday)
+        # The trading_date will be the last trading day, but we shouldn't execute
+        # because we already would have executed on that day
+        logger.info(f"Today ({today}) is not a trading day (weekend/holiday). "
+                   f"Skipping execution to avoid duplicate orders.")
+        logger.info(f"Next trading day: {calendar.next_trading_day(today)}")
+        logger.info("Use --force to run anyway (for testing/insights)")
+        storage.close()
+        return
+    elif not calendar.is_trading_day(today) and force_mode:
+        logger.warning(f"FORCE MODE: Running on non-trading day ({today}). "
+                      f"Using data as-of {trading_date} for insights only.")
+    
+    # Check for existing log (idempotency)
+    # This prevents duplicate orders if the script runs multiple times on the same day
+    log_dir = Path("logs") / "live_trading"
+    log_file = log_dir / f"daily_log_{trading_date}.json"
+    
+    if args.skip_if_logged and log_file.exists() and not force_mode:
+        # Read the log to check when it was created
+        try:
+            with open(log_file, 'r') as f:
+                existing_log = json.load(f)
+            log_timestamp = existing_log.get('timestamp', 'unknown')
+            logger.info(f"Log already exists for {trading_date} (created: {log_timestamp}), "
+                       f"skipping to avoid duplicate orders (use --force to override)")
+        except Exception:
+            logger.info(f"Log already exists for {trading_date}, skipping (use --force to override)")
+        storage.close()
+        return
+    elif args.skip_if_logged and log_file.exists() and force_mode:
+        logger.warning(f"FORCE MODE: Bypassing idempotency check (log exists for {trading_date})")
+    
+    # Initialize API
+    api = AsOfQueryAPI(storage)
     
     # Get universe
     if args.symbols:
@@ -575,7 +653,7 @@ def main():
     if len(features_df) == 0:
         logger.error("No features generated")
         storage.close()
-        return
+        sys.exit(1)
     
     logger.info(f"Generated features for {len(features_df)} assets")
     
@@ -586,9 +664,67 @@ def main():
         X[col] = pd.to_numeric(X[col], errors='coerce')
     X = X.fillna(0)
     
+    current_feature_count = X.shape[1]
+    logger.info(f"Current feature count: {current_feature_count}")
+    
+    # Check if model features match current features
+    # Get expected feature count from model if available
+    try:
+        if hasattr(model, 'n_features_in_'):
+            model_feature_count = model.n_features_in_
+        elif hasattr(model, 'model') and hasattr(model.model, 'n_features_in_'):
+            model_feature_count = model.model.n_features_in_
+        else:
+            model_feature_count = None
+        
+        if model_feature_count and model_feature_count != current_feature_count:
+            logger.warning(
+                f"Feature mismatch: model expects {model_feature_count} features, "
+                f"but current data has {current_feature_count}. Retraining model..."
+            )
+            
+            # Retrain with current features
+            model = load_or_train_model(
+                model_path=model_path,
+                model_type=args.model_type,
+                storage=storage,
+                api=api,
+                config=config,
+                training_end_date=(pd.Timestamp(trading_date) - pd.Timedelta(days=1)).date(),
+                universe=universe,
+                horizon=args.horizon,
+                force_retrain=True,  # Force retrain due to feature mismatch
+                expected_feature_count=current_feature_count
+            )
+            logger.info("Model retrained successfully with current features")
+    except Exception as e:
+        logger.warning(f"Could not validate feature count: {e}")
+    
     # Generate predictions
     logger.info("Generating predictions...")
-    predictions = model.predict(X)
+    try:
+        predictions = model.predict(X)
+    except ValueError as e:
+        if "Feature shape mismatch" in str(e) or "feature" in str(e).lower():
+            logger.error(f"Feature mismatch error: {e}")
+            logger.info("Attempting to retrain model with current features...")
+            
+            model = load_or_train_model(
+                model_path=model_path,
+                model_type=args.model_type,
+                storage=storage,
+                api=api,
+                config=config,
+                training_end_date=(pd.Timestamp(trading_date) - pd.Timedelta(days=1)).date(),
+                universe=universe,
+                horizon=args.horizon,
+                force_retrain=True,
+                expected_feature_count=current_feature_count
+            )
+            predictions = model.predict(X)
+            logger.info("Model retrained and predictions generated successfully")
+        else:
+            raise
     
     # Create scores DataFrame
     scores_df = pd.DataFrame({
