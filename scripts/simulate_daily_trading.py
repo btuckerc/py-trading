@@ -47,10 +47,11 @@ from data.storage import StorageBackend
 from data.asof_api import AsOfQueryAPI
 from data.universe import TradingCalendar
 from features.pipeline import FeaturePipeline
-from models.tabular import XGBoostModel, LightGBMModel
+from models.tabular import XGBoostModel, LightGBMModel, EnsembleXGBoostModel
 from models.training import WalkForwardRetrainer
 from labels.returns import ReturnLabelGenerator
 from portfolio.strategies import LongTopKStrategy
+from portfolio.scores import ScoreConverter, MultiHorizonConfig
 
 
 def parse_args():
@@ -93,6 +94,22 @@ def parse_args():
         help="Override time-decay lambda. Higher = more emphasis on recent data"
     )
     parser.add_argument(
+        "--model-type", type=str, default="xgboost", choices=["xgboost", "lightgbm", "ensemble_xgboost"],
+        help="Model type to use (default: xgboost)"
+    )
+    parser.add_argument(
+        "--horizon", type=int, default=20,
+        help="Prediction horizon (days) for single-horizon mode (default: 20)"
+    )
+    parser.add_argument(
+        "--multi-horizon", action="store_true",
+        help="Enable multi-horizon prediction and blending"
+    )
+    parser.add_argument(
+        "--horizons", type=int, nargs="+",
+        help="Prediction horizons (days) for multi-horizon mode (default: from config)"
+    )
+    parser.add_argument(
         "--initial-capital", type=float, default=100000,
         help="Initial portfolio value (default: 100000)"
     )
@@ -132,7 +149,11 @@ class DailyTradingSimulator:
         train_days: int = 252,
         initial_capital: float = 100000,
         use_policy: bool = False,
-        retraining_config: RetrainingConfig = None
+        retraining_config: RetrainingConfig = None,
+        model_type: str = "xgboost",
+        horizon: int = 20,
+        horizons: Optional[List[int]] = None,
+        multi_horizon: bool = False
     ):
         self.storage = storage
         self.config = config
@@ -143,9 +164,22 @@ class DailyTradingSimulator:
         self.initial_capital = initial_capital
         self.use_policy = use_policy
         self.retraining_config = retraining_config
+        self.model_type = model_type
+        self.horizon = horizon
+        self.multi_horizon = multi_horizon
+        self.horizons = horizons if horizons else ([1, 5, 20, 120] if multi_horizon else [horizon])
+        
+        # Load multi-horizon config if needed
+        self.score_converter = None
+        if multi_horizon:
+            portfolio_config = config.get('portfolio', {}) if isinstance(config, dict) else getattr(config, 'portfolio', {})
+            if isinstance(portfolio_config, dict) and 'multi_horizon' in portfolio_config:
+                multi_horizon_config = MultiHorizonConfig.from_config(portfolio_config['multi_horizon'])
+                self.score_converter = ScoreConverter(config=multi_horizon_config)
+                logger.info(f"Multi-horizon mode: horizons {self.horizons}, method={multi_horizon_config.method}")
         
         # Will be set during simulation
-        self.model = None
+        self.model = None  # Single model or dict of models for multi-horizon
         self.feature_pipeline = None
         self.universe = None
         self.symbol_map = None  # asset_id -> symbol
@@ -236,143 +270,126 @@ class DailyTradingSimulator:
         """
         return self.storage.query(query)
     
-    def _train_model(self, train_end_date: date, universe: set) -> Tuple[XGBoostModel, FeaturePipeline]:
+    def _train_model(self, train_end_date: date, universe: set):
         """
-        Train model using only data up to train_end_date.
+        Train model(s) using only data up to train_end_date.
         This ensures no future data leakage.
         
         If use_policy is True, uses time-decay weighting from retraining_config.
+        If multi_horizon is True, trains one model per horizon.
+        
+        Returns:
+            Tuple of (model or dict of models, feature_pipeline)
         """
+        from models.tabular_trainer import TabularTrainer, TrainingConfig, SamplingStrategy
+        
         # Calculate training period
         if self.use_policy and self.retraining_config:
             # Use window from config
             train_start = self.retraining_config.get_window_start(train_end_date)
+            time_decay_enabled = self.retraining_config.time_decay.enabled
+            time_decay_lambda = self.retraining_config.time_decay.lambda_
+            time_decay_min_weight = self.retraining_config.time_decay.min_weight
         else:
             # Use fixed train_days
             train_start = train_end_date - timedelta(days=self.train_days * 2)
+            time_decay_enabled = False
+            time_decay_lambda = 0.001
+            time_decay_min_weight = 0.1
         
-        trading_days = self.calendar.get_trading_days(train_start, train_end_date)
-        trading_days = [d.date() if hasattr(d, 'date') else d for d in trading_days]
+        logger.info(f"Training model(s) on {train_start} to {train_end_date}")
+        if time_decay_enabled:
+            logger.info(f"Time-decay weighting enabled (lambda={time_decay_lambda})")
         
-        if not self.use_policy and len(trading_days) < self.train_days:
-            raise ValueError(f"Not enough trading days for training. Need {self.train_days}, got {len(trading_days)}")
+        # Initialize components
+        feature_pipeline = FeaturePipeline(self.api, self.config.get('features') if isinstance(self.config, dict) else getattr(self.config, 'features', None))
+        label_generator = ReturnLabelGenerator(self.storage)
         
-        # Use last train_days trading days (or all if using policy)
-        if self.use_policy:
-            train_dates = trading_days
+        # Determine model class and params
+        if self.model_type == "ensemble_xgboost":
+            model_class = EnsembleXGBoostModel
+            model_params = {"task_type": "regression", "n_models": 5, "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
+        elif self.model_type == "xgboost":
+            model_class = XGBoostModel
+            model_params = {"task_type": "regression", "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
         else:
-            train_dates = trading_days[-self.train_days:]
+            model_class = LightGBMModel
+            model_params = {"task_type": "regression", "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
         
-        train_start = train_dates[0]
-        train_end = train_dates[-1]
+        # Initialize TabularTrainer
+        trainer = TabularTrainer(
+            feature_pipeline=feature_pipeline,
+            label_generator=label_generator,
+            storage=self.storage,
+            api=self.api,
+        )
         
-        logger.info(f"Training model on {train_start} to {train_end} ({len(train_dates)} days)")
-        if self.use_policy and self.retraining_config and self.retraining_config.time_decay.enabled:
-            logger.info(f"Time-decay weighting enabled (lambda={self.retraining_config.time_decay.lambda_})")
-        
-        # Initialize feature pipeline
-        feature_pipeline = FeaturePipeline(self.api)
-        
-        # Get training data - sample dates for efficiency
-        sample_size = min(20, len(train_dates))
-        sample_indices = np.linspace(0, len(train_dates) - 1, sample_size, dtype=int)
-        sample_dates = [train_dates[i] for i in sample_indices]
-        
-        # Build features for sampled dates
-        features_list = []
-        labels_list = []
-        date_list = []  # Track dates for time-decay weighting
-        
-        for sample_date in sample_dates:
-            try:
-                # Get features as of this date
-                features_df = feature_pipeline.build_features_cross_sectional(
-                    as_of_date=sample_date,
-                    universe=set(universe),
-                    lookback_days=252
+        if self.multi_horizon:
+            # Train one model per horizon
+            models = {}
+            for horizon in self.horizons:
+                logger.info(f"Training {self.model_type} model for horizon {horizon}d...")
+                
+                training_config = TrainingConfig(
+                    window_start=train_start,
+                    window_end=train_end_date,
+                    horizons=[horizon],
+                    sampling=SamplingStrategy(sample_every_n_days=5),
+                    time_decay_enabled=time_decay_enabled,
+                    time_decay_lambda=time_decay_lambda,
+                    time_decay_min_weight=time_decay_min_weight,
+                    feature_lookback_days=252,
+                    benchmark_symbol="SPY",
                 )
                 
-                if features_df.empty:
-                    continue
+                training_result = trainer.train(
+                    model_class=model_class,
+                    model_params=model_params,
+                    config=training_config,
+                    universe=universe,
+                )
                 
-                # Get forward returns (20-day) for labels
-                # This is the ONLY place we look forward, and it's for training labels
-                future_date = sample_date + timedelta(days=30)  # ~20 trading days
-                future_bars = self.api.get_bars_asof(future_date, universe=universe, lookback_days=5)
-                current_bars = self.api.get_bars_asof(sample_date, universe=universe, lookback_days=5)
-                
-                if future_bars.empty or current_bars.empty:
-                    continue
-                
-                # Calculate returns
-                current_prices = current_bars.groupby('asset_id')['close'].last()
-                future_prices = future_bars.groupby('asset_id')['close'].last()
-                
-                common_assets = current_prices.index.intersection(future_prices.index)
-                returns = (future_prices[common_assets] - current_prices[common_assets]) / current_prices[common_assets]
-                
-                # Merge with features
-                features_df = features_df[features_df['asset_id'].isin(common_assets)]
-                features_df = features_df.set_index('asset_id')
-                features_df['forward_return'] = returns
-                features_df = features_df.dropna(subset=['forward_return'])
-                
-                if not features_df.empty:
-                    features_list.append(features_df.reset_index())
-                    # Track dates for each sample
-                    date_list.extend([sample_date] * len(features_df))
-                    
-            except Exception as e:
-                logger.debug(f"Skipping {sample_date}: {e}")
-                continue
-        
-        if not features_list:
-            raise ValueError("Could not generate any training data")
-        
-        # Combine all training data
-        train_df = pd.concat(features_list, ignore_index=True)
-        
-        # Prepare X and y
-        feature_cols = [c for c in train_df.columns if c not in ['asset_id', 'date', 'forward_return', 'symbol']]
-        X = train_df[feature_cols].values
-        y = train_df['forward_return'].values
-        
-        # Handle NaN/inf
-        X = np.nan_to_num(X, nan=0, posinf=0, neginf=0)
-        
-        # Compute time-decay sample weights if using policy
-        sample_weights = None
-        if self.use_policy and self.retraining_config and self.retraining_config.time_decay.enabled:
-            sample_weights = self.retraining_config.compute_sample_weights(date_list, train_end_date)
-            sample_weights = np.array(sample_weights)
-            logger.info(f"Sample weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
-        
-        logger.info(f"Training on {len(train_df)} samples with {len(feature_cols)} features")
-        
-        # Train model with sample weights
-        model = XGBoostModel(
-            n_estimators=100,
-            max_depth=5,
-            learning_rate=0.1,
-            random_state=42
-        )
-        model.fit(X, y, sample_weight=sample_weights)
-        
-        # Store feature columns for prediction
-        model.feature_columns = feature_cols
-        
-        return model, feature_pipeline
+                models[horizon] = training_result.model
+                logger.info(f"Horizon {horizon}d: {training_result.num_samples} samples, {training_result.feature_count} features")
+            
+            return models, feature_pipeline
+        else:
+            # Single-horizon training
+            training_config = TrainingConfig(
+                window_start=train_start,
+                window_end=train_end_date,
+                horizons=[self.horizon],
+                sampling=SamplingStrategy(sample_every_n_days=5),
+                time_decay_enabled=time_decay_enabled,
+                time_decay_lambda=time_decay_lambda,
+                time_decay_min_weight=time_decay_min_weight,
+                feature_lookback_days=252,
+                benchmark_symbol="SPY",
+            )
+            
+            training_result = trainer.train(
+                model_class=model_class,
+                model_params=model_params,
+                config=training_config,
+                universe=universe,
+            )
+            
+            logger.info(f"Training complete: {training_result.num_samples} samples, {training_result.feature_count} features")
+            
+            return training_result.model, feature_pipeline
     
     def _get_daily_predictions(
         self,
         trading_date: date,
-        model: XGBoostModel,
+        model,  # Single model or dict of models for multi-horizon
         feature_pipeline: FeaturePipeline,
         universe: set
     ) -> Dict[int, float]:
         """
         Get model predictions for a specific date.
         Uses only data available as of that date.
+        
+        Supports both single-horizon and multi-horizon models.
         """
         # Build features as of trading_date
         features_df = feature_pipeline.build_features_cross_sectional(
@@ -384,20 +401,88 @@ class DailyTradingSimulator:
         if features_df.empty:
             return {}
         
-        # Prepare features
-        feature_cols = model.feature_columns
-        missing_cols = set(feature_cols) - set(features_df.columns)
-        for col in missing_cols:
-            features_df[col] = 0
-        
-        X = features_df[feature_cols].values
-        X = np.nan_to_num(X, nan=0, posinf=0, neginf=0)
-        
-        # Get predictions
-        predictions = model.predict(X)
-        
-        # Return as dict: asset_id -> predicted_return
-        return dict(zip(features_df['asset_id'], predictions))
+        if self.multi_horizon and isinstance(model, dict):
+            # Multi-horizon: get predictions for each horizon and blend
+            predictions_dict = {}
+            
+            # Get feature columns from first model (they should all be the same)
+            first_model = list(model.values())[0]
+            if hasattr(first_model, 'feature_columns'):
+                feature_cols = first_model.feature_columns
+            else:
+                # Fallback: use all columns except metadata
+                feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date', 'symbol']]
+            
+            # Prepare features
+            missing_cols = set(feature_cols) - set(features_df.columns)
+            for col in missing_cols:
+                features_df[col] = 0
+            
+            X = features_df[feature_cols].values
+            X = np.nan_to_num(X, nan=0, posinf=0, neginf=0)
+            
+            # Get predictions for each horizon
+            for horizon, horizon_model in model.items():
+                if hasattr(horizon_model, 'predict_with_uncertainty'):
+                    # EnsembleXGBoostModel or similar
+                    mu, sigma = horizon_model.predict_with_uncertainty(X)
+                    predictions_dict[horizon] = {'mu': mu, 'sigma': sigma}
+                else:
+                    mu = horizon_model.predict(X)
+                    sigma = np.abs(mu) * 0.1 + 0.05  # Heuristic uncertainty
+                    predictions_dict[horizon] = {'mu': mu, 'sigma': sigma}
+            
+            # Blend multi-horizon predictions using ScoreConverter
+            if self.score_converter:
+                blended_predictions = {}
+                for idx, asset_id in enumerate(features_df['asset_id'].values):
+                    pred_dict = {}
+                    for horizon in self.horizons:
+                        if horizon in predictions_dict:
+                            pred_dict[horizon] = {
+                                'mu': predictions_dict[horizon]['mu'][idx],
+                                'sigma': predictions_dict[horizon]['sigma'][idx]
+                            }
+                    
+                    if pred_dict:
+                        score = self.score_converter.combine_scores(pred_dict)
+                        blended_predictions[asset_id] = score
+                    else:
+                        blended_predictions[asset_id] = 0.0
+                
+                return blended_predictions
+            else:
+                # Fallback: simple weighted average
+                weights = {h: 1.0/len(self.horizons) for h in self.horizons}
+                blended_predictions = {}
+                for idx, asset_id in enumerate(features_df['asset_id'].values):
+                    score = sum(predictions_dict[h]['mu'][idx] * weights.get(h, 0.0) for h in self.horizons if h in predictions_dict)
+                    blended_predictions[asset_id] = score
+                return blended_predictions
+        else:
+            # Single-horizon
+            # Prepare features
+            if hasattr(model, 'feature_columns'):
+                feature_cols = model.feature_columns
+            else:
+                feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date', 'symbol']]
+            
+            missing_cols = set(feature_cols) - set(features_df.columns)
+            for col in missing_cols:
+                features_df[col] = 0
+            
+            X = features_df[feature_cols].values
+            X = np.nan_to_num(X, nan=0, posinf=0, neginf=0)
+            
+            # Get predictions
+            if hasattr(model, 'predict_with_uncertainty'):
+                mu, _ = model.predict_with_uncertainty(X)
+                predictions = mu
+            else:
+                predictions = model.predict(X)
+            
+            # Return as dict: asset_id -> predicted_return
+            return dict(zip(features_df['asset_id'], predictions))
     
     def _select_portfolio(self, predictions: Dict[int, float]) -> List[Tuple[int, float]]:
         """
@@ -871,15 +956,31 @@ def main():
                 retraining_config.time_decay.lambda_ = args.time_decay_lambda
                 logger.info(f"Overriding time-decay lambda to {args.time_decay_lambda}")
         
+        # Determine horizons for multi-horizon mode
+        horizons = None
+        multi_horizon = args.multi_horizon
+        if multi_horizon:
+            if args.horizons:
+                horizons = args.horizons
+            else:
+                # Get from config
+                labels_config = config.labels if isinstance(config.labels, dict) else config.labels.__dict__ if hasattr(config, 'labels') else {}
+                horizons = labels_config.get('horizons', [1, 5, 20, 120])
+            logger.info(f"Multi-horizon mode: horizons {horizons}")
+        
         # Create simulator
         simulator = DailyTradingSimulator(
             storage=storage,
-            config=config,
+            config=config.__dict__ if hasattr(config, '__dict__') else config,
             top_k=args.top_k,
             train_days=args.train_days,
             initial_capital=args.initial_capital,
             use_policy=args.use_policy,
-            retraining_config=retraining_config
+            retraining_config=retraining_config,
+            model_type=args.model_type,
+            horizon=args.horizon,
+            horizons=horizons,
+            multi_horizon=multi_horizon
         )
         
         # Run simulation

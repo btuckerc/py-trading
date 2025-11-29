@@ -87,6 +87,18 @@ def run_report(period_name: str, start_date: date, end_date: date, args):
     if args.top_k:
         cmd.extend(["--top-k", str(args.top_k)])
     
+    if args.multi_horizon:
+        cmd.append("--multi-horizon")
+    
+    if args.horizons:
+        cmd.extend(["--horizons"] + [str(h) for h in args.horizons])
+    
+    if args.use_policy:
+        cmd.append("--use-policy")
+    
+    if args.model_type:
+        cmd.extend(["--model-type", args.model_type])
+    
     # Run the command
     try:
         result = subprocess.run(cmd, check=True, cwd=Path(__file__).parent.parent)
@@ -128,6 +140,18 @@ def run_simulation_with_capital(period_name: str, start_date: date, end_date: da
     
     if args.top_k:
         sim_cmd.extend(["--top-k", str(args.top_k)])
+    
+    if args.multi_horizon:
+        sim_cmd.append("--multi-horizon")
+    
+    if args.horizons:
+        sim_cmd.extend(["--horizons"] + [str(h) for h in args.horizons])
+    
+    if args.use_policy:
+        sim_cmd.append("--use-policy")
+    
+    if args.model_type:
+        sim_cmd.extend(["--model-type", args.model_type])
     
     try:
         with open(json_path, 'w') as f:
@@ -208,6 +232,22 @@ def main():
     parser.add_argument(
         "--capital-variants", action="store_true",
         help="Run reports for both $10k and $100k initial capital"
+    )
+    parser.add_argument(
+        "--multi-horizon", action="store_true",
+        help="Enable multi-horizon prediction and blending"
+    )
+    parser.add_argument(
+        "--horizons", type=int, nargs="+",
+        help="Prediction horizons (days) for multi-horizon mode (default: from config)"
+    )
+    parser.add_argument(
+        "--use-policy", action="store_true",
+        help="Use retraining policy from config (cadence, time-decay weighting)"
+    )
+    parser.add_argument(
+        "--model-type", type=str, default="xgboost", choices=["xgboost", "lightgbm", "ensemble_xgboost"],
+        help="Model type to use (default: xgboost)"
     )
     
     args = parser.parse_args()

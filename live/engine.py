@@ -358,10 +358,12 @@ class LiveEngine:
         feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date']]
         X = features_df[feature_cols].copy()
         
-        # Ensure numeric
+        # Ensure numeric - convert to float64 explicitly
         for col in X.columns:
             X[col] = pd.to_numeric(X[col], errors='coerce')
         X = X.fillna(0)
+        # Convert to float64 to avoid object dtype issues
+        X = X.astype(np.float64)
         
         # Check model type
         if isinstance(self.model, dict):
@@ -389,24 +391,42 @@ class LiveEngine:
         Returns:
             Tuple of (predictions, uncertainties)
         """
+        # Ensure X is properly numeric before any model calls
+        # Convert to float64 to avoid object dtype issues
+        X_clean = X.copy()
+        for col in X_clean.columns:
+            X_clean[col] = pd.to_numeric(X_clean[col], errors='coerce')
+        X_clean = X_clean.fillna(0).astype(np.float64)
+        
         # Check for ensemble model with uncertainty support
         if hasattr(model, 'predict_with_uncertainty'):
             # EnsembleXGBoostModel or similar
-            pred, sigma = model.predict_with_uncertainty(X)
-            return pred, sigma
+            try:
+                pred, sigma = model.predict_with_uncertainty(X_clean)
+                return pred, sigma
+            except Exception as e:
+                logger.warning(f"predict_with_uncertainty failed, falling back to predict: {e}")
         
         # Check for sklearn/xgboost style model
         if hasattr(model, 'predict'):
-            pred = model.predict(X)
-            
-            # Try to estimate uncertainty from model internals
-            sigma = self._estimate_uncertainty(model, X, pred)
-            return pred, sigma
+            try:
+                pred = model.predict(X_clean)
+                
+                # Try to estimate uncertainty from model internals
+                sigma = self._estimate_uncertainty(model, X_clean, pred)
+                return pred, sigma
+            except Exception as e:
+                logger.warning(f"predict failed: {e}")
         
         # PyTorch model
         try:
             import torch
-            X_tensor = torch.FloatTensor(X.values)
+            # Ensure X is numeric and convert to numpy array
+            X_array = X_clean.values
+            # Double-check dtype
+            if X_array.dtype == np.object_ or X_array.dtype == object:
+                X_array = X_clean.astype(np.float64).values
+            X_tensor = torch.FloatTensor(X_array)
             
             if hasattr(model, 'predict_mc'):
                 # MC dropout for uncertainty

@@ -113,14 +113,39 @@ def parse_args():
         "--initial-capital", type=float, default=100000,
         help="Initial portfolio capital (default: 100000)"
     )
+    parser.add_argument(
+        "--multi-horizon", action="store_true",
+        help="Enable multi-horizon prediction and blending"
+    )
+    parser.add_argument(
+        "--horizons", type=int, nargs="+",
+        help="Prediction horizons (days) for multi-horizon mode (default: from config)"
+    )
+    parser.add_argument(
+        "--use-policy", action="store_true",
+        help="Use retraining policy from config (cadence, time-decay weighting)"
+    )
+    parser.add_argument(
+        "--model-type", type=str, default="xgboost", choices=["xgboost", "lightgbm", "ensemble_xgboost"],
+        help="Model type to use (default: xgboost)"
+    )
     
     return parser.parse_args()
 
 
-def run_simulation(start_date: str, end_date: str, top_k: int = 5, initial_capital: float = 100000) -> dict:
+def run_simulation(
+    start_date: str, 
+    end_date: str, 
+    top_k: int = 5, 
+    initial_capital: float = 100000,
+    multi_horizon: bool = False,
+    horizons: list = None,
+    use_policy: bool = False,
+    model_type: str = "xgboost"
+) -> dict:
     """Run the simulation and return results."""
     from scripts.simulate_daily_trading import DailyTradingSimulator
-    from configs.loader import get_config
+    from configs.loader import get_config, RetrainingConfig
     from data.storage import StorageBackend
     
     config = get_config()
@@ -130,18 +155,38 @@ def run_simulation(start_date: str, end_date: str, top_k: int = 5, initial_capit
     )
     
     try:
+        # Get retraining config if using policy
+        retraining_config = None
+        if use_policy:
+            retraining_config = config.retraining if hasattr(config, 'retraining') else None
+        
+        # Determine horizons
+        target_horizons = None
+        if multi_horizon:
+            if horizons:
+                target_horizons = horizons
+            else:
+                labels_config = config.labels if isinstance(config.labels, dict) else config.labels.__dict__ if hasattr(config, 'labels') else {}
+                target_horizons = labels_config.get('horizons', [1, 5, 20, 120])
+        
         simulator = DailyTradingSimulator(
             storage=storage,
             config=config.__dict__,
             top_k=top_k,
             train_days=252,
-            initial_capital=initial_capital
+            initial_capital=initial_capital,
+            use_policy=use_policy,
+            retraining_config=retraining_config,
+            model_type=model_type,
+            horizon=20,  # Default for single-horizon
+            horizons=target_horizons,
+            multi_horizon=multi_horizon
         )
         
         results = simulator.simulate(
             start_date=datetime.strptime(start_date, "%Y-%m-%d").date(),
             end_date=datetime.strptime(end_date, "%Y-%m-%d").date(),
-            retrain_frequency=0,
+            retrain_frequency=0 if use_policy else 0,  # Use policy if enabled
             verbose=False
         )
         return results
@@ -1339,7 +1384,16 @@ def main():
             results = json.load(f)
     else:
         print(f"Running simulation from {args.start_date} to {args.end_date}...")
-        results = run_simulation(args.start_date, args.end_date, args.top_k, args.initial_capital)
+        results = run_simulation(
+            args.start_date, 
+            args.end_date, 
+            args.top_k, 
+            args.initial_capital,
+            multi_horizon=args.multi_horizon,
+            horizons=args.horizons,
+            use_policy=args.use_policy,
+            model_type=args.model_type
+        )
     
     # Calculate additional metrics
     print("Calculating metrics...")
