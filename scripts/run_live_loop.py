@@ -110,10 +110,16 @@ def load_or_train_model(
     horizon: int = 20,
     train_days: int = 750,  # ~3 years
     force_retrain: bool = False,
-    expected_feature_count: int = None
+    expected_feature_count: int = None,
+    use_retraining_policy: bool = True
 ) -> object:
     """
     Load model from disk or train a new one.
+    
+    Now uses the retraining policy from config for:
+    - Determining if retraining is needed (cadence)
+    - Time-decay sample weighting
+    - Training window calculation
     
     Args:
         model_path: Path to model artifact
@@ -124,13 +130,19 @@ def load_or_train_model(
         training_end_date: End date for training data
         universe: Asset universe to train on
         horizon: Prediction horizon in days
-        train_days: Number of days of training data
+        train_days: Number of days of training data (fallback if no policy)
         force_retrain: If True, retrain even if model exists
         expected_feature_count: If provided, validate model has this many features
+        use_retraining_policy: If True, use config.retraining for cadence and weighting
     
     Returns:
         Trained model
     """
+    # Get retraining config
+    retraining_config = None
+    if use_retraining_policy and hasattr(config, 'retraining'):
+        retraining_config = config.retraining
+    
     # Check if model exists and is recent
     if model_path.exists() and not force_retrain:
         try:
@@ -140,34 +152,64 @@ def load_or_train_model(
             # Check if model is recent enough
             model_date = model_data.get('trained_date')
             if model_date:
-                model_age_days = (training_end_date - model_date).days
-                retrain_frequency = config.live.get('retrain_frequency_days', 30) if hasattr(config, 'live') else 30
-                
-                if model_age_days <= retrain_frequency:
-                    # Validate feature count if provided
-                    if expected_feature_count is not None:
-                        model_feature_count = model_data.get('feature_count')
-                        if model_feature_count and model_feature_count != expected_feature_count:
-                            logger.warning(
-                                f"Model feature count mismatch: model has {model_feature_count}, "
-                                f"but current features have {expected_feature_count}. Retraining..."
-                            )
+                # Use retraining policy cadence if available, else fall back to live config
+                if retraining_config:
+                    should_retrain, reason = retraining_config.should_retrain(
+                        model_date, training_end_date
+                    )
+                    if not should_retrain:
+                        # Validate feature count if provided
+                        if expected_feature_count is not None:
+                            model_feature_count = model_data.get('feature_count')
+                            if model_feature_count and model_feature_count != expected_feature_count:
+                                logger.warning(
+                                    f"Model feature count mismatch: model has {model_feature_count}, "
+                                    f"but current features have {expected_feature_count}. Retraining..."
+                                )
+                            else:
+                                model_age_days = (training_end_date - model_date).days
+                                logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
+                                return model_data['model']
+                        else:
+                            model_age_days = (training_end_date - model_date).days
+                            logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
+                            return model_data['model']
+                    else:
+                        logger.info(f"Retraining needed: {reason}")
+                else:
+                    # Legacy behavior: use live config retrain_frequency_days
+                    model_age_days = (training_end_date - model_date).days
+                    retrain_frequency = config.live.get('retrain_frequency_days', 30) if hasattr(config, 'live') else 30
+                    
+                    if model_age_days <= retrain_frequency:
+                        # Validate feature count if provided
+                        if expected_feature_count is not None:
+                            model_feature_count = model_data.get('feature_count')
+                            if model_feature_count and model_feature_count != expected_feature_count:
+                                logger.warning(
+                                    f"Model feature count mismatch: model has {model_feature_count}, "
+                                    f"but current features have {expected_feature_count}. Retraining..."
+                                )
+                            else:
+                                logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
+                                return model_data['model']
                         else:
                             logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
                             return model_data['model']
                     else:
-                        logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
-                        return model_data['model']
-                else:
-                    logger.info(f"Model is {model_age_days} days old, retraining...")
+                        logger.info(f"Model is {model_age_days} days old, retraining...")
         except Exception as e:
             logger.warning(f"Could not load model from {model_path}: {e}")
     
     # Train new model
     logger.info(f"Training new {model_type} model...")
     
-    # Calculate training period
-    training_start_date = (pd.Timestamp(training_end_date) - pd.Timedelta(days=train_days)).date()
+    # Calculate training period using retraining config if available
+    if retraining_config:
+        training_start_date = retraining_config.get_window_start(training_end_date)
+        logger.info(f"Using retraining policy: {retraining_config.window_type} window, {retraining_config.window_years} years")
+    else:
+        training_start_date = (pd.Timestamp(training_end_date) - pd.Timedelta(days=train_days)).date()
     
     # Generate labels
     label_generator = ReturnLabelGenerator(storage)
@@ -194,6 +236,7 @@ def load_or_train_model(
     
     X_train_list = []
     y_train_list = []
+    date_list = []  # Track dates for time-decay weighting
     
     for train_date in train_dates:
         try:
@@ -231,6 +274,8 @@ def load_or_train_model(
             
             X_train_list.append(X)
             y_train_list.append(y)
+            # Track dates for each sample
+            date_list.extend([train_date] * len(merged))
             
         except Exception as e:
             continue
@@ -241,9 +286,17 @@ def load_or_train_model(
     X_train = pd.concat(X_train_list, ignore_index=True)
     y_train = np.concatenate(y_train_list)
     
+    # Compute time-decay sample weights if using retraining policy
+    sample_weights = None
+    if retraining_config and retraining_config.time_decay.enabled:
+        sample_weights = retraining_config.compute_sample_weights(date_list, training_end_date)
+        sample_weights = np.array(sample_weights)
+        logger.info(f"Time-decay weighting enabled (lambda={retraining_config.time_decay.lambda_})")
+        logger.info(f"Sample weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
+    
     logger.info(f"Training on {len(X_train)} samples with {len(X_train.columns)} features")
     
-    # Train model
+    # Train model with sample weights
     logger.info(f"Initializing {model_type} model...")
     if model_type == "xgboost":
         model = XGBoostModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
@@ -253,20 +306,29 @@ def load_or_train_model(
         raise ValueError(f"Unknown model_type: {model_type}")
     
     logger.info("Starting model.fit()...")
-    model.fit(X_train, y_train)
+    model.fit(X_train, y_train, sample_weight=sample_weights)
     logger.info("Model training complete.")
     
-    # Save model
+    # Save model with retraining config info
     model_path.parent.mkdir(parents=True, exist_ok=True)
     model_data = {
         'model': model,
         'trained_date': training_end_date,
+        'effective_start': training_end_date,
+        'effective_end': None,  # Will be set by next retrain
         'model_type': model_type,
         'horizon': horizon,
         'feature_cols': list(X_train.columns),
-        'feature_count': len(X_train.columns),  # Store feature count for validation
+        'feature_count': len(X_train.columns),
         'training_samples': len(X_train),
-        'config_hash': get_config_hash(dict(config.features)) if hasattr(config, 'features') else None
+        'config_hash': get_config_hash(dict(config.features)) if hasattr(config, 'features') else None,
+        'retraining_config': {
+            'cadence_days': retraining_config.cadence_days if retraining_config else None,
+            'window_type': retraining_config.window_type if retraining_config else None,
+            'window_years': retraining_config.window_years if retraining_config else None,
+            'time_decay_enabled': retraining_config.time_decay.enabled if retraining_config else False,
+            'time_decay_lambda': retraining_config.time_decay.lambda_ if retraining_config else None,
+        }
     }
     
     with open(model_path, 'wb') as f:
@@ -343,6 +405,14 @@ def main():
     # Alerting options
     parser.add_argument("--enable-alerts", action="store_true", help="Enable email/Slack alerts")
     parser.add_argument("--alert-dry-run", action="store_true", help="Log alerts but don't send them")
+    
+    # Retraining policy options
+    parser.add_argument("--no-retraining-policy", action="store_true",
+                       help="Disable retraining policy (use legacy retrain_frequency_days)")
+    parser.add_argument("--retrain-cadence", type=int, default=None,
+                       help="Override retraining cadence from config (days)")
+    parser.add_argument("--time-decay-lambda", type=float, default=None,
+                       help="Override time-decay lambda. Higher = more emphasis on recent data")
     
     args = parser.parse_args()
     
@@ -507,6 +577,16 @@ def main():
     # Load or train model
     model_path = Path(args.model_path) if args.model_path else Path("artifacts/models/live_model.pkl")
     
+    # Override retraining config if command-line args provided
+    use_retraining_policy = not args.no_retraining_policy
+    if use_retraining_policy and hasattr(config, 'retraining'):
+        if args.retrain_cadence is not None:
+            config.retraining.cadence_days = args.retrain_cadence
+            logger.info(f"Overriding retrain cadence to {args.retrain_cadence} days")
+        if args.time_decay_lambda is not None:
+            config.retraining.time_decay.lambda_ = args.time_decay_lambda
+            logger.info(f"Overriding time-decay lambda to {args.time_decay_lambda}")
+    
     try:
         model = load_or_train_model(
             model_path=model_path,
@@ -517,7 +597,8 @@ def main():
             training_end_date=(pd.Timestamp(trading_date) - pd.Timedelta(days=1)).date(),
             universe=universe,
             horizon=args.horizon,
-            force_retrain=args.force_retrain
+            force_retrain=args.force_retrain,
+            use_retraining_policy=use_retraining_policy
         )
     except Exception as e:
         logger.error(f"Failed to load/train model: {e}")

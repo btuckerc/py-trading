@@ -40,6 +40,7 @@ import json
 
 from portfolio.costs import TransactionCostModel
 from labels.regimes import RegimeLabelGenerator
+from models.training import WalkForwardRetrainer
 import hashlib
 
 
@@ -122,10 +123,15 @@ def run_walk_forward_evaluation(
     """
     Run walk-forward evaluation: train on rolling window, test on next period.
     
+    Now uses the retraining policy from config for time-decay sample weighting.
+    
     Returns:
         Dict with aggregated metrics and per-window results
     """
     calendar = TradingCalendar()
+    
+    # Get retraining config for time-decay weights
+    retraining_config = config.retraining if config and hasattr(config, 'retraining') else None
     
     # Calculate windows
     windows = []
@@ -153,6 +159,8 @@ def run_walk_forward_evaluation(
         return {'windows': [], 'aggregate_metrics': {}}
     
     logger.info(f"Running walk-forward with {len(windows)} windows")
+    if retraining_config and retraining_config.time_decay.enabled:
+        logger.info(f"Time-decay weighting enabled (lambda={retraining_config.time_decay.lambda_})")
     
     window_results = []
     all_equity_curves = []
@@ -181,6 +189,7 @@ def run_walk_forward_evaluation(
             
             X_train_list = []
             y_train_list = []
+            date_list = []  # Track dates for time-decay weighting
             
             for train_date in trading_days:
                 try:
@@ -215,6 +224,8 @@ def run_walk_forward_evaluation(
                     
                     X_train_list.append(X)
                     y_train_list.append(y)
+                    # Track dates for each sample
+                    date_list.extend([train_date] * len(merged))
                 except Exception:
                     continue
             
@@ -225,13 +236,20 @@ def run_walk_forward_evaluation(
             X_train = pd.concat(X_train_list, ignore_index=True)
             y_train = np.concatenate(y_train_list)
             
-            # Train model
+            # Compute time-decay sample weights
+            sample_weights = None
+            if retraining_config and retraining_config.time_decay.enabled:
+                sample_weights = retraining_config.compute_sample_weights(date_list, window['train_end'])
+                sample_weights = np.array(sample_weights)
+                logger.debug(f"Sample weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
+            
+            # Train model with sample weights
             if model_type == "xgboost":
                 model = XGBoostModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
             else:
                 model = LightGBMModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
             
-            model.fit(X_train, y_train)
+            model.fit(X_train, y_train, sample_weight=sample_weights)
             
             # Run test period
             strategy = LongTopKStrategy(k=top_k, min_score_threshold=-np.inf)
@@ -322,6 +340,166 @@ def run_walk_forward_evaluation(
     return {
         'windows': window_results,
         'aggregate_metrics': aggregate_metrics
+    }
+
+
+def run_policy_driven_backtest(
+    storage: StorageBackend,
+    api: AsOfQueryAPI,
+    universe: set,
+    start_date: date,
+    end_date: date,
+    model_type: str = "xgboost",
+    horizon: int = 20,
+    top_k: int = 3,
+    initial_capital: float = 100000.0,
+    config = None
+) -> dict:
+    """
+    Run a backtest using the retraining policy from config.
+    
+    This simulates exactly what would happen in live trading:
+    - Model is retrained according to cadence_days
+    - Time-decay weighting is applied to training samples
+    - Adaptive retraining triggers are checked
+    
+    Returns:
+        Dict with equity curve, metrics, and retraining history
+    """
+    calendar = TradingCalendar()
+    
+    # Get retraining config
+    if not config or not hasattr(config, 'retraining'):
+        logger.warning("No retraining config found, using defaults")
+        from configs.loader import RetrainingConfig
+        retraining_config = RetrainingConfig()
+    else:
+        retraining_config = config.retraining
+    
+    logger.info(f"Running policy-driven backtest with cadence={retraining_config.cadence_days} days")
+    logger.info(f"Window: {retraining_config.window_type}, {retraining_config.window_years} years")
+    logger.info(f"Time-decay: enabled={retraining_config.time_decay.enabled}, lambda={retraining_config.time_decay.lambda_}")
+    
+    # Initialize components
+    feature_pipeline = FeaturePipeline(api, config.features if config else None)
+    label_generator = ReturnLabelGenerator(storage)
+    
+    # Model class and params
+    if model_type == "xgboost":
+        model_class = XGBoostModel
+        model_params = {"task_type": "regression", "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
+    else:
+        model_class = LightGBMModel
+        model_params = {"task_type": "regression", "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
+    
+    # Initialize walk-forward retrainer
+    retrainer = WalkForwardRetrainer(
+        retraining_config=retraining_config,
+        model_class=model_class,
+        model_params=model_params,
+        feature_pipeline=feature_pipeline,
+        label_generator=label_generator,
+        storage=storage,
+        api=api,
+        universe=universe,
+        horizon=horizon
+    )
+    
+    # Get trading days
+    trading_days = [d.date() for d in calendar.get_trading_days(start_date, end_date)]
+    
+    # Strategy
+    strategy = LongTopKStrategy(k=top_k, min_score_threshold=-np.inf)
+    
+    # Run backtest day by day
+    all_weights = []
+    retraining_history = []
+    
+    for i, trading_date in enumerate(trading_days):
+        try:
+            # Get model for this date (may trigger retraining)
+            model, was_retrained = retrainer.get_model_for_date(trading_date)
+            
+            if was_retrained:
+                retraining_history.append({
+                    'date': str(trading_date),
+                    'day_index': i,
+                    'model_version': retrainer.model_version
+                })
+            
+            # Build features
+            features_df = feature_pipeline.build_features_cross_sectional(
+                as_of_date=trading_date,
+                universe=universe,
+                lookback_days=252
+            )
+            
+            if len(features_df) == 0:
+                continue
+            
+            # Predict
+            feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date']]
+            X = features_df[feature_cols].copy()
+            for col in X.columns:
+                X[col] = pd.to_numeric(X[col], errors='coerce')
+            X = X.fillna(0)
+            
+            predictions = model.predict(X)
+            
+            # Compute weights
+            scores_df = pd.DataFrame({
+                'asset_id': features_df['asset_id'].values,
+                'score': predictions,
+                'confidence': np.ones(len(predictions))
+            })
+            
+            weights_df = strategy.compute_weights(scores_df, as_of_date=trading_date)
+            if len(weights_df) > 0:
+                weights_df['date'] = trading_date
+                all_weights.append(weights_df)
+            
+            # Update rolling metrics for adaptive retraining (if we have actuals)
+            # This would require looking at next-day returns, which we'll skip for now
+            # to avoid lookahead bias in the backtest
+            
+        except Exception as e:
+            logger.warning(f"Error on {trading_date}: {e}")
+            continue
+    
+    if len(all_weights) == 0:
+        return {'error': 'No weights generated', 'retraining_history': retraining_history}
+    
+    target_weights_df = pd.concat(all_weights, ignore_index=True)
+    
+    # Get prices
+    all_bars = api.get_bars_asof(end_date, universe=universe)
+    all_bars['date'] = pd.to_datetime(all_bars['date']).dt.date
+    prices_df = all_bars[
+        (all_bars['date'] >= start_date) &
+        (all_bars['date'] <= end_date)
+    ].copy()
+    
+    # Run backtest
+    backtester = VectorizedBacktester(initial_capital=initial_capital)
+    equity_curve = backtester.run_backtest(prices_df, target_weights_df, execution_lag=1)
+    
+    if len(equity_curve) == 0:
+        return {'error': 'Empty equity curve', 'retraining_history': retraining_history}
+    
+    metrics = PerformanceMetrics.compute_metrics(equity_curve)
+    
+    return {
+        'metrics': metrics,
+        'equity_curve': equity_curve,
+        'retraining_history': retraining_history,
+        'num_retrains': len(retraining_history),
+        'config': {
+            'cadence_days': retraining_config.cadence_days,
+            'window_type': retraining_config.window_type,
+            'window_years': retraining_config.window_years,
+            'time_decay_enabled': retraining_config.time_decay.enabled,
+            'time_decay_lambda': retraining_config.time_decay.lambda_,
+        }
     }
 
 
@@ -922,6 +1100,12 @@ def main():
     parser.add_argument("--ablation-test", action="store_true", help="Run ablation tests by disabling feature groups")
     parser.add_argument("--auto-fetch", action="store_true", help="Automatically fetch missing data from vendor")
     parser.add_argument("--vendor", type=str, default="yahoo", choices=["yahoo", "tiingo"], help="Data vendor for auto-fetch")
+    parser.add_argument("--policy-driven", action="store_true", 
+                       help="Run policy-driven backtest using retraining config (cadence, time-decay)")
+    parser.add_argument("--retrain-cadence", type=int, default=None,
+                       help="Override retraining cadence (days). Default: use config value")
+    parser.add_argument("--time-decay-lambda", type=float, default=None,
+                       help="Override time-decay lambda. Higher = more emphasis on recent data")
     
     args = parser.parse_args()
     
@@ -1525,6 +1709,71 @@ def main():
         
         # Store for saving
         all_results['walk_forward'] = wf_results
+    
+    # Policy-driven backtest (uses retraining config)
+    if args.policy_driven:
+        logger.info("Running policy-driven backtest...")
+        
+        # Override config if command-line args provided
+        if args.retrain_cadence is not None:
+            config.retraining.cadence_days = args.retrain_cadence
+            logger.info(f"Overriding retrain cadence to {args.retrain_cadence} days")
+        if args.time_decay_lambda is not None:
+            config.retraining.time_decay.lambda_ = args.time_decay_lambda
+            logger.info(f"Overriding time-decay lambda to {args.time_decay_lambda}")
+        
+        policy_results = run_policy_driven_backtest(
+            storage=storage,
+            api=api,
+            universe=universe,
+            start_date=start_date,
+            end_date=end_date,
+            model_type=args.model,
+            horizon=args.horizon,
+            top_k=args.top_k,
+            initial_capital=args.initial_capital,
+            config=config
+        )
+        
+        print("\n" + "-"*80)
+        print("POLICY-DRIVEN BACKTEST:")
+        print("-"*80)
+        
+        if 'error' not in policy_results:
+            policy_metrics = policy_results['metrics']
+            policy_config = policy_results['config']
+            
+            print(f"  Retraining Policy:")
+            print(f"    Cadence: {policy_config['cadence_days']} days")
+            print(f"    Window: {policy_config['window_type']}, {policy_config['window_years']} years")
+            print(f"    Time-decay: {'enabled' if policy_config['time_decay_enabled'] else 'disabled'}")
+            if policy_config['time_decay_enabled']:
+                print(f"    Lambda: {policy_config['time_decay_lambda']}")
+            print(f"  Number of Retrains: {policy_results['num_retrains']}")
+            print(f"\n  Performance:")
+            print(f"    Sharpe: {policy_metrics['sharpe_ratio']:.3f}")
+            print(f"    CAGR: {policy_metrics['cagr']:.2%}")
+            print(f"    Max DD: {policy_metrics['max_drawdown']:.2%}")
+            print(f"    Calmar: {policy_metrics['calmar_ratio']:.3f}")
+            
+            # Compare with baseline (single-train) if available
+            baseline_sharpe = metrics['sharpe_ratio']
+            improvement = ((policy_metrics['sharpe_ratio'] / baseline_sharpe) - 1) * 100 if baseline_sharpe > 0 else 0
+            print(f"\n  vs Single-Train Baseline:")
+            print(f"    Sharpe improvement: {improvement:+.1f}%")
+            
+            # Show retraining dates
+            if policy_results['retraining_history']:
+                print(f"\n  Retraining History:")
+                for rt in policy_results['retraining_history'][:5]:  # Show first 5
+                    print(f"    {rt['date']} (day {rt['day_index']}, v{rt['model_version']})")
+                if len(policy_results['retraining_history']) > 5:
+                    print(f"    ... and {len(policy_results['retraining_history']) - 5} more")
+        else:
+            print(f"  Error: {policy_results['error']}")
+        print("-"*80)
+        
+        all_results['policy_driven'] = policy_results
     
     # Regime-aware modeling
     if args.regime_aware:

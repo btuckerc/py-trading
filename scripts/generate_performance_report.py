@@ -99,11 +99,15 @@ def parse_args():
         "--benchmarks", type=str,
         help="Comma-separated list of benchmarks to show (e.g., 'sp500,dow,nasdaq' or 'SPY,QQQ')"
     )
+    parser.add_argument(
+        "--initial-capital", type=float, default=100000,
+        help="Initial portfolio capital (default: 100000)"
+    )
     
     return parser.parse_args()
 
 
-def run_simulation(start_date: str, end_date: str, top_k: int = 5) -> dict:
+def run_simulation(start_date: str, end_date: str, top_k: int = 5, initial_capital: float = 100000) -> dict:
     """Run the simulation and return results."""
     from scripts.simulate_daily_trading import DailyTradingSimulator
     from configs.loader import get_config
@@ -121,7 +125,7 @@ def run_simulation(start_date: str, end_date: str, top_k: int = 5) -> dict:
             config=config.__dict__,
             top_k=top_k,
             train_days=252,
-            initial_capital=100000
+            initial_capital=initial_capital
         )
         
         results = simulator.simulate(
@@ -310,8 +314,11 @@ def generate_equity_curve(results: dict, metrics: dict, colors: dict, output_pat
     
     dates = [datetime.strptime(d, "%Y-%m-%d") for d in metrics["dates"]]
     
+    # Get initial capital from results (default to 100000 for backward compatibility)
+    initial_capital = results.get("summary", {}).get("initial_capital", 100000)
+    
     # Plot equity curves
-    portfolio_equity = [100000 * c for c in metrics["portfolio_cumulative"]]
+    portfolio_equity = [initial_capital * c for c in metrics["portfolio_cumulative"]]
     ax.plot(dates, portfolio_equity, label="ML Strategy", color=colors["portfolio"], linewidth=2)
     
     # Plot all benchmarks
@@ -334,7 +341,7 @@ def generate_equity_curve(results: dict, metrics: dict, colors: dict, output_pat
     
     for i, (ticker, cumulative) in enumerate(benchmark_cumulative.items()):
         if cumulative:
-            equity = [100000 * c for c in cumulative[:len(dates)]]
+            equity = [initial_capital * c for c in cumulative[:len(dates)]]
             display_name = benchmark_display_names.get(ticker, ticker)
             color = benchmark_colors.get(ticker, colors["spy"])
             linestyle = linestyles[i % len(linestyles)]
@@ -350,8 +357,26 @@ def generate_equity_curve(results: dict, metrics: dict, colors: dict, output_pat
     ax.set_xlabel("Date", fontsize=11)
     ax.set_ylabel("Portfolio Value ($)", fontsize=11)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f"${x:,.0f}"))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
-    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    
+    # Adaptive date formatting based on period length
+    num_days = (dates[-1] - dates[0]).days if len(dates) > 1 else 1
+    if num_days <= 14:
+        # Less than 2 weeks: show individual days
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=max(1, num_days // 7)))
+    elif num_days <= 60:
+        # Less than 2 months: show weeks
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO))
+    elif num_days <= 365:
+        # Less than a year: show months
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+    else:
+        # More than a year: show quarters
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    
     plt.xticks(rotation=45)
     ax.legend(loc="upper left", frameon=True)
     ax.grid(True, alpha=0.3)
@@ -365,7 +390,7 @@ def generate_equity_curve(results: dict, metrics: dict, colors: dict, output_pat
     y_offset = 0
     for ticker, cumulative in benchmark_cumulative.items():
         if cumulative:
-            equity = [100000 * c for c in cumulative[:len(dates)]]
+            equity = [initial_capital * c for c in cumulative[:len(dates)]]
             if equity:
                 final_value = equity[-1]
                 color = benchmark_colors.get(ticker, colors["spy"])
@@ -399,8 +424,22 @@ def generate_drawdown_chart(results: dict, metrics: dict, colors: dict, output_p
     ax.set_title("Portfolio Drawdown", fontsize=14, fontweight="bold", pad=20)
     ax.set_xlabel("Date", fontsize=11)
     ax.set_ylabel("Drawdown (%)", fontsize=11)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
-    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    
+    # Adaptive date formatting based on period length
+    num_days = (dates[-1] - dates[0]).days if len(dates) > 1 else 1
+    if num_days <= 14:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=max(1, num_days // 7)))
+    elif num_days <= 60:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO))
+    elif num_days <= 365:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+    else:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    
     plt.xticks(rotation=45)
     ax.grid(True, alpha=0.3)
     ax.set_ylim(min(drawdown) * 1.2, 1)
@@ -566,9 +605,12 @@ def generate_summary_dashboard(results: dict, metrics: dict, colors: dict, outpu
     summary = results["summary"]
     dates = [datetime.strptime(d, "%Y-%m-%d") for d in metrics["dates"]]
     
+    # Get initial capital from results (default to 100000 for backward compatibility)
+    initial_capital = summary.get("initial_capital", 100000)
+    
     # 1. Equity Curve (top, spans 2 columns)
     ax1 = fig.add_subplot(gs[0, :2])
-    portfolio_equity = [100000 * c for c in metrics["portfolio_cumulative"]]
+    portfolio_equity = [initial_capital * c for c in metrics["portfolio_cumulative"]]
     ax1.plot(dates, portfolio_equity, label="ML Strategy", color=colors["portfolio"], linewidth=2)
     
     # Plot all benchmarks
@@ -590,7 +632,7 @@ def generate_summary_dashboard(results: dict, metrics: dict, colors: dict, outpu
     
     for i, (ticker, cumulative) in enumerate(benchmark_cumulative.items()):
         if cumulative:
-            equity = [100000 * c for c in cumulative[:len(dates)]]
+            equity = [initial_capital * c for c in cumulative[:len(dates)]]
             display_name = benchmark_display_names.get(ticker, ticker)
             color = benchmark_colors.get(ticker, colors["spy"])
             linestyle = linestyles[i % len(linestyles)]
@@ -600,7 +642,16 @@ def generate_summary_dashboard(results: dict, metrics: dict, colors: dict, outpu
     ax1.fill_between(dates, portfolio_equity, alpha=0.1, color=colors["portfolio"])
     ax1.set_title("Equity Curve", fontsize=12, fontweight="bold")
     ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f"${x/1000:.0f}k"))
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    
+    # Adaptive date formatting based on period length
+    num_days = (dates[-1] - dates[0]).days if len(dates) > 1 else 1
+    if num_days <= 14:
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    elif num_days <= 60:
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    else:
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    
     ax1.legend(loc="upper left", fontsize=9)
     ax1.grid(True, alpha=0.3)
     
@@ -639,7 +690,13 @@ def generate_summary_dashboard(results: dict, metrics: dict, colors: dict, outpu
     ax3.fill_between(dates, drawdown, 0, alpha=0.7, color=colors["negative"])
     ax3.set_title("Drawdown", fontsize=12, fontweight="bold")
     ax3.set_ylabel("%")
-    ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    # Use same adaptive formatting as equity curve
+    if num_days <= 14:
+        ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    elif num_days <= 60:
+        ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    else:
+        ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
     ax3.grid(True, alpha=0.3)
     
     # 4. Returns Distribution (middle center)
@@ -736,6 +793,14 @@ def generate_text_summary(results: dict, metrics: dict) -> str:
     lines.append(f"Trading Days:  {summary['trading_days']}")
     lines.append(f"Universe:      {summary['universe_size']} assets")
     lines.append(f"Strategy:      Long top-{summary['top_k']} (equal weight, daily rebalance)")
+    
+    # Capital info (if available)
+    initial_capital = summary.get('initial_capital')
+    final_value = summary.get('final_value')
+    if initial_capital is not None:
+        lines.append(f"Initial:       ${initial_capital:,.2f}")
+    if final_value is not None:
+        lines.append(f"Final:         ${final_value:,.2f}")
     lines.append("")
     
     # Performance table
@@ -1077,7 +1142,7 @@ def main():
             results = json.load(f)
     else:
         print(f"Running simulation from {args.start_date} to {args.end_date}...")
-        results = run_simulation(args.start_date, args.end_date, args.top_k)
+        results = run_simulation(args.start_date, args.end_date, args.top_k, args.initial_capital)
     
     # Calculate additional metrics
     print("Calculating metrics...")

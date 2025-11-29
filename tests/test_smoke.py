@@ -194,3 +194,91 @@ class TestSimulationClock:
         # All days should be within range
         for day in trading_days:
             assert date(2024, 1, 2) <= day <= date(2024, 1, 10)
+
+
+class TestRetrainingPolicy:
+    """Test retraining policy configuration and functionality."""
+
+    def test_retraining_config_loads(self):
+        """Test that retraining config loads correctly."""
+        from configs.loader import get_config
+        
+        config = get_config()
+        assert hasattr(config, 'retraining')
+        assert config.retraining.cadence_days == 20
+        assert config.retraining.window_type == "rolling"
+        assert config.retraining.window_years == 5
+
+    def test_time_decay_config(self):
+        """Test time-decay configuration."""
+        from configs.loader import get_config
+        
+        config = get_config()
+        assert config.retraining.time_decay.enabled == True
+        assert config.retraining.time_decay.lambda_ == 0.001
+        assert config.retraining.time_decay.min_weight == 0.1
+
+    def test_compute_sample_weights(self):
+        """Test time-decay sample weight computation."""
+        from configs.loader import get_config
+        import numpy as np
+        
+        config = get_config()
+        
+        # Create test dates
+        test_dates = [
+            date(2024, 1, 1),   # Old
+            date(2024, 6, 1),   # Medium
+            date(2024, 12, 1),  # Recent
+        ]
+        as_of = date(2024, 12, 15)
+        
+        weights = config.retraining.compute_sample_weights(test_dates, as_of)
+        
+        # Weights should be in ascending order (recent = higher weight)
+        assert len(weights) == 3
+        assert weights[0] < weights[1] < weights[2]
+        
+        # Most recent should be close to 1.0
+        assert weights[2] > 0.9
+        
+        # Oldest should be above min_weight
+        assert weights[0] >= config.retraining.time_decay.min_weight
+
+    def test_should_retrain_cadence(self):
+        """Test cadence-based retraining trigger."""
+        from configs.loader import get_config
+        
+        config = get_config()
+        
+        # Should not retrain if within cadence
+        should, reason = config.retraining.should_retrain(
+            last_train_date=date(2024, 12, 1),
+            current_date=date(2024, 12, 10)
+        )
+        assert should == False
+        
+        # Should retrain if past cadence
+        should, reason = config.retraining.should_retrain(
+            last_train_date=date(2024, 11, 1),
+            current_date=date(2024, 12, 15)
+        )
+        assert should == True
+        assert "cadence" in reason
+
+    def test_model_versioning_imports(self):
+        """Test model versioning module imports."""
+        from models.versioning import ModelVersionManager, ModelVersion, save_live_model
+        from models.monitoring import PerformanceMonitor, ModelPerformanceTracker
+        
+        assert ModelVersionManager is not None
+        assert ModelVersion is not None
+        assert save_live_model is not None
+        assert PerformanceMonitor is not None
+        assert ModelPerformanceTracker is not None
+
+    def test_walk_forward_retrainer_imports(self):
+        """Test walk-forward retrainer imports."""
+        from models.training import WalkForwardRetrainer
+        
+        assert WalkForwardRetrainer is not None

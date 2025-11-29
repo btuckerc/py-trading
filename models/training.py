@@ -1,13 +1,374 @@
-"""Training loops for sequence models."""
+"""Training loops for sequence models and walk-forward retraining utilities."""
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from typing import Dict, Optional
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from typing import Dict, Optional, List, Tuple, Any
 from pathlib import Path
+from datetime import date, datetime
 import numpy as np
+import pandas as pd
+import pickle
+import json
 from models.torch.losses import MultiHorizonLoss
 from models.splits import TimeSplit
+
+
+# =============================================================================
+# Walk-Forward Retraining Manager
+# =============================================================================
+
+class WalkForwardRetrainer:
+    """
+    Manages walk-forward model retraining with time-decay sample weighting.
+    
+    This class implements the retraining policy defined in configs/base.yaml,
+    ensuring consistent behavior across backtests, simulations, and live trading.
+    """
+    
+    def __init__(
+        self,
+        retraining_config,
+        model_class,
+        model_params: Dict[str, Any],
+        feature_pipeline,
+        label_generator,
+        storage,
+        api,
+        universe: set,
+        horizon: int = 20,
+    ):
+        """
+        Initialize the walk-forward retrainer.
+        
+        Args:
+            retraining_config: RetrainingConfig instance from configs
+            model_class: Model class to instantiate (e.g., XGBoostModel)
+            model_params: Parameters to pass to model constructor
+            feature_pipeline: FeaturePipeline instance
+            label_generator: ReturnLabelGenerator instance
+            storage: StorageBackend instance
+            api: AsOfQueryAPI instance
+            universe: Set of asset_ids to train on
+            horizon: Prediction horizon in days
+        """
+        self.config = retraining_config
+        self.model_class = model_class
+        self.model_params = model_params
+        self.feature_pipeline = feature_pipeline
+        self.label_generator = label_generator
+        self.storage = storage
+        self.api = api
+        self.universe = universe
+        self.horizon = horizon
+        
+        # State
+        self.current_model = None
+        self.last_train_date = None
+        self.model_version = 0
+        self.rolling_metrics = {}
+        self.model_history = []  # List of (date, model_path, metrics)
+    
+    def get_model_for_date(self, as_of_date: date) -> Tuple[Any, bool]:
+        """
+        Get the appropriate model for a given date, retraining if necessary.
+        
+        Args:
+            as_of_date: The trading date we need a model for
+            
+        Returns:
+            Tuple of (model, was_retrained)
+        """
+        # Check if we need to retrain
+        if self.current_model is None:
+            # First time - must train
+            self._train_model(as_of_date)
+            return self.current_model, True
+        
+        should_retrain, reason = self.config.should_retrain(
+            self.last_train_date,
+            as_of_date,
+            self.rolling_metrics
+        )
+        
+        if should_retrain:
+            from loguru import logger
+            logger.info(f"Retraining model: {reason}")
+            self._train_model(as_of_date)
+            return self.current_model, True
+        
+        return self.current_model, False
+    
+    def _train_model(self, as_of_date: date):
+        """
+        Train a new model using data up to as_of_date.
+        
+        Uses time-decay weighting from the retraining config.
+        """
+        from loguru import logger
+        from data.universe import TradingCalendar
+        
+        # Calculate training window
+        window_start = self.config.get_window_start(as_of_date)
+        train_end = as_of_date
+        
+        logger.info(f"Training model on {window_start} to {train_end}")
+        
+        # Generate labels
+        labels_df = self.label_generator.generate_labels(
+            start_date=window_start,
+            end_date=train_end,
+            horizons=[self.horizon],
+            benchmark_symbol="SPY",
+            universe=list(self.universe)
+        )
+        
+        if len(labels_df) == 0:
+            raise ValueError(f"No labels generated for {window_start} to {train_end}")
+        
+        # Build features for sampled training dates
+        calendar = TradingCalendar()
+        trading_days = calendar.get_trading_days(window_start, train_end)
+        train_dates = [d.date() for d in trading_days][::5]  # Sample every 5th day
+        
+        X_train_list = []
+        y_train_list = []
+        date_list = []  # Track dates for time-decay weighting
+        
+        for train_date in train_dates:
+            try:
+                features_df = self.feature_pipeline.build_features_cross_sectional(
+                    as_of_date=train_date,
+                    universe=self.universe,
+                    lookback_days=252
+                )
+                
+                if len(features_df) == 0:
+                    continue
+                
+                # Get labels for this date
+                date_labels = labels_df[labels_df['date'] == train_date]
+                if len(date_labels) == 0:
+                    continue
+                
+                # Merge
+                merged = features_df.merge(
+                    date_labels[['asset_id', 'target_excess_log_return']],
+                    on='asset_id',
+                    how='inner'
+                )
+                
+                if len(merged) == 0:
+                    continue
+                
+                # Extract features
+                feature_cols = [c for c in merged.columns 
+                               if c not in ['asset_id', 'date', 'target_excess_log_return']]
+                X = merged[feature_cols].copy()
+                for col in X.columns:
+                    X[col] = pd.to_numeric(X[col], errors='coerce')
+                X = X.fillna(0)
+                y = merged['target_excess_log_return'].values
+                
+                X_train_list.append(X)
+                y_train_list.append(y)
+                # Repeat date for each sample
+                date_list.extend([train_date] * len(merged))
+                
+            except Exception as e:
+                logger.debug(f"Skipping {train_date}: {e}")
+                continue
+        
+        if len(X_train_list) == 0:
+            raise ValueError("No training data generated")
+        
+        X_train = pd.concat(X_train_list, ignore_index=True)
+        y_train = np.concatenate(y_train_list)
+        
+        # Compute time-decay sample weights
+        sample_weights = self.config.compute_sample_weights(date_list, as_of_date)
+        sample_weights = np.array(sample_weights)
+        
+        logger.info(f"Training on {len(X_train)} samples with {len(X_train.columns)} features")
+        logger.info(f"Sample weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
+        
+        # Train model with sample weights
+        model = self.model_class(**self.model_params)
+        model.fit(X_train, y_train, sample_weight=sample_weights)
+        
+        # Update state
+        self.current_model = model
+        self.last_train_date = as_of_date
+        self.model_version += 1
+        
+        # Save model if versioning enabled
+        if self.config.versioning.enabled:
+            self._save_model_version(as_of_date, X_train.columns.tolist(), len(X_train))
+    
+    def _save_model_version(self, as_of_date: date, feature_cols: List[str], n_samples: int):
+        """Save a versioned model artifact."""
+        from loguru import logger
+        
+        artifact_dir = Path(self.config.versioning.artifact_dir)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create versioned filename
+        version_str = as_of_date.strftime("%Y-%m-%d")
+        model_path = artifact_dir / f"model_{version_str}.pkl"
+        
+        model_data = {
+            'model': self.current_model,
+            'trained_date': as_of_date,
+            'effective_start': as_of_date,
+            'effective_end': None,  # Will be set when next version is trained
+            'model_version': self.model_version,
+            'feature_cols': feature_cols,
+            'feature_count': len(feature_cols),
+            'training_samples': n_samples,
+            'config': {
+                'cadence_days': self.config.cadence_days,
+                'window_type': self.config.window_type,
+                'window_years': self.config.window_years,
+                'time_decay_enabled': self.config.time_decay.enabled,
+                'time_decay_lambda': self.config.time_decay.lambda_,
+            }
+        }
+        
+        with open(model_path, 'wb') as f:
+            pickle.dump(model_data, f)
+        
+        logger.info(f"Saved model version to {model_path}")
+        
+        # Update previous version's effective_end
+        if len(self.model_history) > 0:
+            prev_path = self.model_history[-1][1]
+            try:
+                with open(prev_path, 'rb') as f:
+                    prev_data = pickle.load(f)
+                prev_data['effective_end'] = as_of_date
+                with open(prev_path, 'wb') as f:
+                    pickle.dump(prev_data, f)
+            except Exception as e:
+                logger.warning(f"Could not update previous model version: {e}")
+        
+        # Track in history
+        self.model_history.append((as_of_date, model_path, {}))
+        
+        # Clean up old versions
+        self._cleanup_old_versions()
+    
+    def _cleanup_old_versions(self):
+        """Remove old model versions beyond keep_versions limit."""
+        keep = self.config.versioning.keep_versions
+        if len(self.model_history) > keep:
+            from loguru import logger
+            to_remove = self.model_history[:-keep]
+            for _, path, _ in to_remove:
+                try:
+                    Path(path).unlink()
+                    logger.debug(f"Removed old model version: {path}")
+                except Exception:
+                    pass
+            self.model_history = self.model_history[-keep:]
+    
+    def update_rolling_metrics(
+        self,
+        predictions: np.ndarray,
+        actuals: np.ndarray,
+        date: date
+    ):
+        """
+        Update rolling performance metrics for adaptive retraining.
+        
+        Args:
+            predictions: Model predictions
+            actuals: Actual returns
+            date: Date of predictions
+        """
+        # Store recent predictions and actuals
+        if 'history' not in self.rolling_metrics:
+            self.rolling_metrics['history'] = []
+        
+        self.rolling_metrics['history'].append({
+            'date': date,
+            'predictions': predictions,
+            'actuals': actuals
+        })
+        
+        # Keep only lookback_days worth of history
+        lookback = self.config.adaptive.lookback_days
+        if len(self.rolling_metrics['history']) > lookback:
+            self.rolling_metrics['history'] = self.rolling_metrics['history'][-lookback:]
+        
+        # Compute rolling metrics
+        if len(self.rolling_metrics['history']) >= 10:  # Minimum for meaningful stats
+            all_preds = np.concatenate([h['predictions'] for h in self.rolling_metrics['history']])
+            all_actuals = np.concatenate([h['actuals'] for h in self.rolling_metrics['history']])
+            
+            # Hit rate: fraction where sign(pred) == sign(actual)
+            hit_rate = np.mean(np.sign(all_preds) == np.sign(all_actuals))
+            self.rolling_metrics['hit_rate'] = hit_rate
+            
+            # Simple Sharpe proxy: mean(actual) / std(actual) for top-ranked predictions
+            # This is a rough approximation
+            top_mask = all_preds > np.median(all_preds)
+            if top_mask.sum() > 0:
+                top_returns = all_actuals[top_mask]
+                if len(top_returns) > 1 and np.std(top_returns) > 0:
+                    sharpe_proxy = np.mean(top_returns) / np.std(top_returns) * np.sqrt(252)
+                    self.rolling_metrics['sharpe'] = sharpe_proxy
+            
+            # Calibration: ratio of realized variance to predicted variance
+            pred_var = np.var(all_preds)
+            actual_var = np.var(all_actuals)
+            if pred_var > 0:
+                self.rolling_metrics['calibration_ratio'] = actual_var / pred_var
+    
+    def load_model_for_date(self, target_date: date) -> Optional[Any]:
+        """
+        Load the appropriate model version for a historical date.
+        
+        Used in backtests to ensure we use the model that would have been
+        available at that point in time.
+        
+        Args:
+            target_date: The date we need a model for
+            
+        Returns:
+            Model if found, None otherwise
+        """
+        artifact_dir = Path(self.config.versioning.artifact_dir)
+        
+        # Find all model versions
+        model_files = sorted(artifact_dir.glob("model_*.pkl"))
+        
+        best_model = None
+        best_date = None
+        
+        for model_path in model_files:
+            try:
+                with open(model_path, 'rb') as f:
+                    model_data = pickle.load(f)
+                
+                trained_date = model_data.get('trained_date')
+                effective_end = model_data.get('effective_end')
+                
+                # Model is valid if trained before target_date and
+                # (no effective_end or effective_end > target_date)
+                if trained_date and trained_date <= target_date:
+                    if effective_end is None or effective_end > target_date:
+                        if best_date is None or trained_date > best_date:
+                            best_model = model_data['model']
+                            best_date = trained_date
+                            
+            except Exception:
+                continue
+        
+        if best_model:
+            self.current_model = best_model
+            self.last_train_date = best_date
+        
+        return best_model
 
 
 class SequenceTrainer:

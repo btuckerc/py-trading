@@ -253,6 +253,46 @@ training:
       test_start: "2019-01-01"
       test_end: "2020-12-31"
 
+# =============================================================================
+# Model Retraining Policy
+# =============================================================================
+# Controls how and when models are retrained to incorporate new information.
+# This policy applies to backtests (walk-forward), simulations, and live trading.
+retraining:
+  # Cadence: how often to retrain (in trading days)
+  # Options: 5 (weekly), 10 (biweekly), 20 (monthly), 60 (quarterly)
+  cadence_days: 20
+  
+  # History window: how much historical data to use for training
+  # Options: "rolling" (fixed window) or "expanding" (all data from anchor)
+  window_type: "rolling"
+  window_years: 5  # For rolling: use last N years; for expanding: minimum years required
+  
+  # Time-decay weighting for training samples
+  # Recent samples get higher weight: w(t) = exp(-lambda * age_in_days)
+  # Higher lambda = more emphasis on recent data (Prophet-style)
+  time_decay:
+    enabled: true
+    lambda: 0.001  # Decay rate (0.001 = ~37% weight at 1000 days old)
+    min_weight: 0.1  # Floor to prevent old data from being ignored entirely
+  
+  # Adaptive retraining: trigger early retrain if performance degrades
+  adaptive:
+    enabled: true
+    # Performance thresholds (rolling window metrics)
+    sharpe_floor: -0.5  # Retrain if rolling 60-day Sharpe drops below this
+    hit_rate_floor: 0.40  # Retrain if rolling hit rate drops below 40%
+    calibration_threshold: 2.0  # Retrain if realized/predicted variance ratio exceeds this
+    lookback_days: 60  # Window for computing rolling metrics
+  
+  # Model versioning
+  versioning:
+    enabled: true
+    artifact_dir: "artifacts/models"
+    keep_versions: 10  # Number of old versions to keep
+    # Regularization to prevent drastic changes between versions
+    stability_penalty: 0.1  # L2 penalty on prediction changes vs prior model
+
 # Live trading
 live:
   enabled: false

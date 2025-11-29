@@ -42,12 +42,14 @@ warnings.filterwarnings('ignore')
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from configs.loader import get_config
+from configs.loader import get_config, RetrainingConfig
 from data.storage import StorageBackend
 from data.asof_api import AsOfQueryAPI
 from data.universe import TradingCalendar
 from features.pipeline import FeaturePipeline
-from models.tabular import XGBoostModel
+from models.tabular import XGBoostModel, LightGBMModel
+from models.training import WalkForwardRetrainer
+from labels.returns import ReturnLabelGenerator
 from portfolio.strategies import LongTopKStrategy
 
 
@@ -75,7 +77,20 @@ def parse_args():
     )
     parser.add_argument(
         "--retrain-frequency", type=int, default=0,
-        help="Retrain model every N days (0 = train once at start, default: 0)"
+        help="Retrain model every N days (0 = train once at start, default: 0). "
+             "Use --use-policy to use config-driven retraining instead."
+    )
+    parser.add_argument(
+        "--use-policy", action="store_true",
+        help="Use retraining policy from config (cadence, time-decay weighting)"
+    )
+    parser.add_argument(
+        "--retrain-cadence", type=int, default=None,
+        help="Override retraining cadence from config (days)"
+    )
+    parser.add_argument(
+        "--time-decay-lambda", type=float, default=None,
+        help="Override time-decay lambda. Higher = more emphasis on recent data"
     )
     parser.add_argument(
         "--initial-capital", type=float, default=100000,
@@ -103,15 +118,21 @@ def parse_args():
 class DailyTradingSimulator:
     """
     Simulates daily trading decisions with strict point-in-time correctness.
+    
+    Supports two retraining modes:
+    1. Simple: retrain every N days (--retrain-frequency)
+    2. Policy-driven: use config-based cadence, time-decay weighting (--use-policy)
     """
     
     def __init__(
         self,
         storage: StorageBackend,
-        config: dict,
+        config,
         top_k: int = 5,
         train_days: int = 252,
-        initial_capital: float = 100000
+        initial_capital: float = 100000,
+        use_policy: bool = False,
+        retraining_config: RetrainingConfig = None
     ):
         self.storage = storage
         self.config = config
@@ -120,12 +141,16 @@ class DailyTradingSimulator:
         self.top_k = top_k
         self.train_days = train_days
         self.initial_capital = initial_capital
+        self.use_policy = use_policy
+        self.retraining_config = retraining_config
         
         # Will be set during simulation
         self.model = None
         self.feature_pipeline = None
         self.universe = None
         self.symbol_map = None  # asset_id -> symbol
+        self.retrainer = None  # WalkForwardRetrainer for policy mode
+        self.retraining_history = []  # Track when retraining occurred
         
     def _get_universe(self, as_of_date: date) -> set:
         """Get universe as of a specific date (point-in-time correct)."""
@@ -145,6 +170,60 @@ class DailyTradingSimulator:
         assets = self.storage.query("SELECT asset_id, symbol FROM assets")
         return dict(zip(assets['asset_id'], assets['symbol']))
     
+    def _ensure_benchmark_data(self, benchmark_symbols: List[str], start_date: date, end_date: date):
+        """
+        Ensure benchmark symbols exist in the database with price data.
+        
+        This handles the case where a fresh Docker container doesn't have
+        benchmark ETFs (SPY, DIA, QQQ) in the assets table because they're
+        not part of the S&P 500 constituents CSV.
+        """
+        # Check which benchmarks are missing
+        missing_symbols = []
+        for symbol in benchmark_symbols:
+            result = self.storage.query(f"SELECT asset_id FROM assets WHERE symbol = '{symbol}'")
+            if len(result) == 0:
+                missing_symbols.append(symbol)
+            else:
+                # Check if we have price data for the period
+                asset_id = result.iloc[0]['asset_id']
+                bars = self.storage.query(f"""
+                    SELECT COUNT(*) as cnt FROM bars_daily 
+                    WHERE asset_id = {asset_id} 
+                    AND date >= '{start_date}' AND date <= '{end_date}'
+                """)
+                if bars.iloc[0]['cnt'] == 0:
+                    missing_symbols.append(symbol)
+        
+        if not missing_symbols:
+            return
+        
+        logger.info(f"Fetching missing benchmark data for: {missing_symbols}")
+        
+        try:
+            # Use the data maintenance system to fetch benchmark data
+            from data.maintenance import DataMaintenanceManager
+            
+            maintenance = DataMaintenanceManager(self.storage)
+            
+            # Fetch data for missing benchmarks
+            # Use a buffer before start_date for training data
+            fetch_start = start_date - timedelta(days=400)  # ~1.5 years buffer for training
+            
+            maintenance.ensure_coverage(
+                mode="date-range",
+                target_start=fetch_start,
+                target_end=end_date,
+                symbols=missing_symbols,
+                auto_fetch=True,
+                bootstrap_universe=False  # Don't rebuild universe, just fetch these symbols
+            )
+            
+            logger.info(f"Successfully fetched benchmark data for {missing_symbols}")
+            
+        except Exception as e:
+            logger.warning(f"Could not fetch benchmark data: {e}. Benchmark comparisons may be unavailable.")
+    
     def _get_price_data(self, start_date: date, end_date: date) -> pd.DataFrame:
         """Get price data for the simulation period plus buffer."""
         # Get all bars in the range
@@ -161,23 +240,35 @@ class DailyTradingSimulator:
         """
         Train model using only data up to train_end_date.
         This ensures no future data leakage.
+        
+        If use_policy is True, uses time-decay weighting from retraining_config.
         """
         # Calculate training period
-        trading_days = self.calendar.get_trading_days(
-            train_end_date - timedelta(days=self.train_days * 2),  # Buffer for calendar
-            train_end_date
-        )
+        if self.use_policy and self.retraining_config:
+            # Use window from config
+            train_start = self.retraining_config.get_window_start(train_end_date)
+        else:
+            # Use fixed train_days
+            train_start = train_end_date - timedelta(days=self.train_days * 2)
+        
+        trading_days = self.calendar.get_trading_days(train_start, train_end_date)
         trading_days = [d.date() if hasattr(d, 'date') else d for d in trading_days]
         
-        if len(trading_days) < self.train_days:
+        if not self.use_policy and len(trading_days) < self.train_days:
             raise ValueError(f"Not enough trading days for training. Need {self.train_days}, got {len(trading_days)}")
         
-        # Use last train_days trading days
-        train_dates = trading_days[-self.train_days:]
+        # Use last train_days trading days (or all if using policy)
+        if self.use_policy:
+            train_dates = trading_days
+        else:
+            train_dates = trading_days[-self.train_days:]
+        
         train_start = train_dates[0]
         train_end = train_dates[-1]
         
         logger.info(f"Training model on {train_start} to {train_end} ({len(train_dates)} days)")
+        if self.use_policy and self.retraining_config and self.retraining_config.time_decay.enabled:
+            logger.info(f"Time-decay weighting enabled (lambda={self.retraining_config.time_decay.lambda_})")
         
         # Initialize feature pipeline
         feature_pipeline = FeaturePipeline(self.api)
@@ -190,6 +281,7 @@ class DailyTradingSimulator:
         # Build features for sampled dates
         features_list = []
         labels_list = []
+        date_list = []  # Track dates for time-decay weighting
         
         for sample_date in sample_dates:
             try:
@@ -227,6 +319,8 @@ class DailyTradingSimulator:
                 
                 if not features_df.empty:
                     features_list.append(features_df.reset_index())
+                    # Track dates for each sample
+                    date_list.extend([sample_date] * len(features_df))
                     
             except Exception as e:
                 logger.debug(f"Skipping {sample_date}: {e}")
@@ -246,16 +340,23 @@ class DailyTradingSimulator:
         # Handle NaN/inf
         X = np.nan_to_num(X, nan=0, posinf=0, neginf=0)
         
+        # Compute time-decay sample weights if using policy
+        sample_weights = None
+        if self.use_policy and self.retraining_config and self.retraining_config.time_decay.enabled:
+            sample_weights = self.retraining_config.compute_sample_weights(date_list, train_end_date)
+            sample_weights = np.array(sample_weights)
+            logger.info(f"Sample weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
+        
         logger.info(f"Training on {len(train_df)} samples with {len(feature_cols)} features")
         
-        # Train model
+        # Train model with sample weights
         model = XGBoostModel(
             n_estimators=100,
             max_depth=5,
             learning_rate=0.1,
             random_state=42
         )
-        model.fit(X, y)
+        model.fit(X, y, sample_weight=sample_weights)
         
         # Store feature columns for prediction
         model.feature_columns = feature_cols
@@ -396,15 +497,23 @@ class DailyTradingSimulator:
             benchmark_symbols = ['SPY']
             benchmark_names['SPY'] = 'S&P 500'
         
+        # Ensure benchmark symbols exist in the database (auto-fetch if missing)
+        self._ensure_benchmark_data(benchmark_symbols, start_date, end_date)
+        
         # Get asset_ids for all benchmarks
         benchmark_asset_ids = {}
         for symbol in benchmark_symbols:
             result = self.storage.query(f"SELECT asset_id FROM assets WHERE symbol = '{symbol}'")
             if len(result) > 0:
                 benchmark_asset_ids[symbol] = result.iloc[0]['asset_id']
+            else:
+                logger.warning(f"Benchmark {symbol} not found in assets table after fetch attempt")
         
         # Backward compatibility: keep SPY asset_id for spy_return
         spy_asset_id = benchmark_asset_ids.get('SPY', None)
+        
+        if not benchmark_asset_ids:
+            logger.warning("No benchmark data available - benchmark comparisons will be skipped")
         
         # Simulation state
         portfolio_value = self.initial_capital
@@ -416,11 +525,34 @@ class DailyTradingSimulator:
             next_date = trading_days[i + 1]
             
             # Check if we need to retrain
-            if retrain_frequency > 0 and i > 0 and (i - last_train_day) >= retrain_frequency:
-                logger.info(f"Retraining model at day {i} ({trading_date})")
+            should_retrain = False
+            retrain_reason = ""
+            
+            if self.use_policy and self.retraining_config:
+                # Policy-driven retraining
+                if self.model is None:
+                    should_retrain = True
+                    retrain_reason = "initial training"
+                else:
+                    last_train_date = trading_days[last_train_day] if last_train_day >= 0 else trading_days[0]
+                    should_retrain, retrain_reason = self.retraining_config.should_retrain(
+                        last_train_date, trading_date
+                    )
+            elif retrain_frequency > 0 and i > 0 and (i - last_train_day) >= retrain_frequency:
+                # Simple frequency-based retraining
+                should_retrain = True
+                retrain_reason = f"frequency ({retrain_frequency} days)"
+            
+            if should_retrain:
+                logger.info(f"Retraining model at day {i} ({trading_date}): {retrain_reason}")
                 train_end = trading_date - timedelta(days=1)
                 self.model, self.feature_pipeline = self._train_model(train_end, self.universe)
                 last_train_day = i
+                self.retraining_history.append({
+                    'date': str(trading_date),
+                    'day_index': i,
+                    'reason': retrain_reason
+                })
             
             # Get predictions for this date
             try:
@@ -494,17 +626,36 @@ class DailyTradingSimulator:
         total_return = (portfolio_value - self.initial_capital) / self.initial_capital
         
         # Calculate benchmark total returns
+        # Use the actual dates we have data for, not just trading_days[0] and trading_days[-1]
         benchmark_total_returns = {}
         spy_total_return = None  # Backward compatibility
         
         for symbol, asset_id in benchmark_asset_ids.items():
-            start_price = price_lookup.get((trading_days[0], asset_id))
-            end_price = price_lookup.get((trading_days[-1], asset_id))
+            # Find first and last dates with price data for this benchmark
+            start_price = None
+            end_price = None
+            
+            # Search forward from start for first available price
+            for d in trading_days:
+                price = price_lookup.get((d, asset_id))
+                if price is not None:
+                    start_price = price
+                    break
+            
+            # Search backward from end for last available price
+            for d in reversed(trading_days):
+                price = price_lookup.get((d, asset_id))
+                if price is not None:
+                    end_price = price
+                    break
+            
             if start_price and end_price:
                 bench_return = (end_price - start_price) / start_price
                 benchmark_total_returns[symbol] = bench_return
                 if symbol == 'SPY':
                     spy_total_return = bench_return
+            else:
+                logger.debug(f"No price data found for benchmark {symbol} in the simulation period")
         
         # Calculate additional metrics
         daily_returns = [r["portfolio_return"] for r in daily_results]
@@ -529,6 +680,21 @@ class DailyTradingSimulator:
         primary_return = benchmark_total_returns.get(primary_ticker, spy_total_return)
         alpha_pct = (total_return - primary_return) * 100 if primary_return else None
         
+        # Build retraining info
+        retraining_info = {
+            "mode": "policy" if self.use_policy else "frequency",
+            "num_retrains": len(self.retraining_history),
+            "history": self.retraining_history
+        }
+        if self.use_policy and self.retraining_config:
+            retraining_info["config"] = {
+                "cadence_days": self.retraining_config.cadence_days,
+                "window_type": self.retraining_config.window_type,
+                "window_years": self.retraining_config.window_years,
+                "time_decay_enabled": self.retraining_config.time_decay.enabled,
+                "time_decay_lambda": self.retraining_config.time_decay.lambda_,
+            }
+        
         return {
             "summary": {
                 "start_date": str(trading_days[0]),
@@ -547,7 +713,8 @@ class DailyTradingSimulator:
                 "max_drawdown_pct": max_drawdown * 100,
                 "win_rate_pct": win_rate * 100,
             },
-            "daily_results": daily_results
+            "daily_results": daily_results,
+            "retraining": retraining_info
         }
 
 
@@ -634,6 +801,29 @@ def format_report(results: dict, verbose: bool = False) -> str:
                 lines.append(f"  {'SPY':6s}:      {day['spy_return']*100:+7.2f}%")
     
     lines.append("")
+    
+    # Retraining info
+    if "retraining" in results:
+        rt = results["retraining"]
+        lines.append("-" * 70)
+        lines.append("RETRAINING INFO")
+        lines.append("-" * 70)
+        lines.append(f"  Mode: {rt['mode']}")
+        lines.append(f"  Number of Retrains: {rt['num_retrains']}")
+        if rt['mode'] == 'policy' and 'config' in rt:
+            cfg = rt['config']
+            lines.append(f"  Cadence: {cfg['cadence_days']} days")
+            lines.append(f"  Window: {cfg['window_type']}, {cfg['window_years']} years")
+            if cfg['time_decay_enabled']:
+                lines.append(f"  Time-decay: lambda={cfg['time_decay_lambda']}")
+        if rt['history']:
+            lines.append(f"  Retrain Dates:")
+            for h in rt['history'][:5]:
+                lines.append(f"    {h['date']} - {h['reason']}")
+            if len(rt['history']) > 5:
+                lines.append(f"    ... and {len(rt['history']) - 5} more")
+        lines.append("")
+    
     lines.append("=" * 70)
     lines.append("NOTES")
     lines.append("=" * 70)
@@ -669,13 +859,27 @@ def main():
     )
     
     try:
+        # Get retraining config if using policy mode
+        retraining_config = None
+        if args.use_policy:
+            retraining_config = config.retraining
+            # Override with command-line args if provided
+            if args.retrain_cadence is not None:
+                retraining_config.cadence_days = args.retrain_cadence
+                logger.info(f"Overriding retrain cadence to {args.retrain_cadence} days")
+            if args.time_decay_lambda is not None:
+                retraining_config.time_decay.lambda_ = args.time_decay_lambda
+                logger.info(f"Overriding time-decay lambda to {args.time_decay_lambda}")
+        
         # Create simulator
         simulator = DailyTradingSimulator(
             storage=storage,
-            config=config.__dict__,
+            config=config,
             top_k=args.top_k,
             train_days=args.train_days,
-            initial_capital=args.initial_capital
+            initial_capital=args.initial_capital,
+            use_policy=args.use_policy,
+            retraining_config=retraining_config
         )
         
         # Run simulation

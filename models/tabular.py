@@ -51,8 +51,17 @@ class XGBoostModel(BaseModel):
         self.params = kwargs
         self.feature_names = None
     
-    def fit(self, X_train, y_train, X_val=None, y_val=None):
-        """Fit XGBoost model."""
+    def fit(self, X_train, y_train, X_val=None, y_val=None, sample_weight=None):
+        """
+        Fit XGBoost model.
+        
+        Args:
+            X_train: Training features
+            y_train: Training labels
+            X_val: Optional validation features
+            y_val: Optional validation labels
+            sample_weight: Optional array of sample weights (e.g., time-decay weights)
+        """
         if isinstance(X_train, pd.DataFrame):
             self.feature_names = X_train.columns.tolist()
             X_train = X_train.values
@@ -68,7 +77,12 @@ class XGBoostModel(BaseModel):
                 X_val = X_val.values
             eval_set = [(X_val, y_val)]
         
-        self.model.fit(X_train, y_train, eval_set=eval_set, verbose=False)
+        self.model.fit(
+            X_train, y_train, 
+            eval_set=eval_set, 
+            verbose=False,
+            sample_weight=sample_weight
+        )
     
     def predict(self, X):
         """Make predictions."""
@@ -177,17 +191,26 @@ class LightGBMModel(BaseModel):
         self.params = kwargs
         self.feature_names = None
     
-    def fit(self, X_train, y_train, X_val=None, y_val=None):
-        """Fit LightGBM model."""
+    def fit(self, X_train, y_train, X_val=None, y_val=None, sample_weight=None):
+        """
+        Fit LightGBM model.
+        
+        Args:
+            X_train: Training features
+            y_train: Training labels
+            X_val: Optional validation features
+            y_val: Optional validation labels
+            sample_weight: Optional array of sample weights (e.g., time-decay weights)
+        """
         if isinstance(X_train, pd.DataFrame):
             self.feature_names = X_train.columns.tolist()
             X_train = X_train.values
         
         if self.task_type == "regression":
-            train_data = lgb.Dataset(X_train, label=y_train)
+            train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weight)
             self.model = lgb.train(self.params, train_data)
         else:
-            train_data = lgb.Dataset(X_train, label=y_train)
+            train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weight)
             self.model = lgb.train(self.params, train_data)
     
     def predict(self, X):

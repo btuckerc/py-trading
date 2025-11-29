@@ -70,7 +70,8 @@ services:
         echo "30 21 * * 1-5 cd /app && python scripts/run_live_loop.py --regime-aware --sector-tilts --vol-scaling --drawdown-throttle --skip-if-logged --enable-alerts >> /app/logs/cron.log 2>&1" > /etc/cron.d/trading
         
         # Create cron job for weekly backtest on Sundays at 2 AM UTC
-        echo "0 2 * * 0 cd /app && python scripts/run_backtest.py --start-date 2020-01-01 --end-date \$$(date +%Y-%m-%d) --model xgboost --horizon 20 --top-k 10 --run-benchmarks --auto-fetch >> /app/logs/weekly_backtest.log 2>&1" >> /etc/cron.d/trading
+        # Uses policy-driven retraining with dynamic date range (last 2 years to today)
+        echo "0 2 * * 0 cd /app && python scripts/run_backtest.py --start-date \$$(date -d '2 years ago' +%Y-%m-%d) --end-date \$$(date +%Y-%m-%d) --model xgboost --horizon 20 --top-k \$${TOP_K:-10} --policy-driven --run-benchmarks --auto-fetch >> /app/logs/weekly_backtest.log 2>&1" >> /etc/cron.d/trading
         
         # Create cron job for daily readiness check at 5 PM ET (22:00 UTC)
         echo "0 22 * * 1-5 cd /app && python scripts/check_live_readiness.py --notify >> /app/logs/readiness.log 2>&1" >> /etc/cron.d/trading
@@ -100,11 +101,16 @@ services:
     command: python scripts/check_live_readiness.py --verbose --notify
 
   # One-off backtest
+  # Usage: docker-compose run --rm backtest
+  # Override dates with env vars: BACKTEST_START=2022-01-01 BACKTEST_END=2024-12-31 docker-compose run --rm backtest
   backtest:
     build: .
     container_name: py-finance-backtest
     env_file:
       - .env
+    environment:
+      - BACKTEST_START=${BACKTEST_START:-2020-01-01}
+      - BACKTEST_END=${BACKTEST_END:-}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -112,13 +118,80 @@ services:
       - ./configs:/app/configs:ro
     profiles:
       - tools
-    command: >
-      python scripts/run_backtest.py
-      --start-date 2020-01-01
-      --end-date 2024-12-31
-      --model xgboost
-      --horizon 20
-      --top-k 10
-      --run-benchmarks
-      --auto-fetch
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        END_DATE=$${BACKTEST_END:-$$(date +%Y-%m-%d)}
+        python scripts/run_backtest.py \
+          --start-date $${BACKTEST_START} \
+          --end-date $${END_DATE} \
+          --model xgboost \
+          --horizon 20 \
+          --top-k $${TOP_K:-10} \
+          --run-benchmarks \
+          --auto-fetch
+
+  # Policy-driven backtest with walk-forward retraining
+  # Usage: docker-compose run --rm backtest-policy
+  # Override: BACKTEST_START=2022-01-01 docker-compose run --rm backtest-policy
+  backtest-policy:
+    build: .
+    container_name: py-finance-backtest-policy
+    env_file:
+      - .env
+    environment:
+      - BACKTEST_START=${BACKTEST_START:-}
+      - BACKTEST_END=${BACKTEST_END:-}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./artifacts:/app/artifacts
+      - ./configs:/app/configs:ro
+    profiles:
+      - tools
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Default to 2 years of backtest if not specified
+        START_DATE=$${BACKTEST_START:-$$(date -d '2 years ago' +%Y-%m-%d 2>/dev/null || date -v-2y +%Y-%m-%d)}
+        END_DATE=$${BACKTEST_END:-$$(date +%Y-%m-%d)}
+        python scripts/run_backtest.py \
+          --start-date $${START_DATE} \
+          --end-date $${END_DATE} \
+          --model xgboost \
+          --horizon 20 \
+          --top-k $${TOP_K:-10} \
+          --policy-driven \
+          --run-benchmarks \
+          --auto-fetch
+
+  # Daily simulation with policy-driven retraining
+  # Usage: docker-compose run --rm simulation
+  # Override: SIM_START=2024-06-01 SIM_END=2024-12-31 docker-compose run --rm simulation
+  simulation:
+    build: .
+    container_name: py-finance-simulation
+    env_file:
+      - .env
+    environment:
+      - SIM_START=${SIM_START:-}
+      - SIM_END=${SIM_END:-}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./artifacts:/app/artifacts
+      - ./configs:/app/configs:ro
+    profiles:
+      - tools
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Default to last 30 days if not specified
+        START_DATE=$${SIM_START:-$$(date -d '30 days ago' +%Y-%m-%d 2>/dev/null || date -v-30d +%Y-%m-%d)}
+        END_DATE=$${SIM_END:-$$(date +%Y-%m-%d)}
+        python scripts/simulate_daily_trading.py \
+          --start-date $${START_DATE} \
+          --end-date $${END_DATE} \
+          --top-k $${TOP_K:-10} \
+          --use-policy
 

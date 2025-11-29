@@ -11,6 +11,13 @@
 #   3. Copy .env with API keys
 #   4. Add crontab entry above (use crontab -e)
 #   5. For launchd alternative, see scripts/com.pyfinance.daily-trading.plist
+#
+# Retraining Policy (configured in configs/base.yaml):
+#   - Models are automatically retrained every 20 trading days (cadence_days)
+#   - Training uses a rolling 5-year window of historical data
+#   - Time-decay weighting (lambda=0.001) gives recent data higher importance
+#   - Adaptive triggers can force early retraining if performance degrades
+#   - All model versions are saved with effective dates for rollback capability
 
 set -e
 
