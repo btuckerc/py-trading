@@ -5,6 +5,7 @@ with explicit effective date ranges, enabling:
 - Point-in-time model selection for backtests
 - Rollback to previous versions
 - Model lineage tracking
+- Feature schema validation
 """
 
 import pickle
@@ -13,6 +14,14 @@ from pathlib import Path
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple, Any
 from loguru import logger
+
+from models.tabular_trainer import (
+    FeatureSchema,
+    TrainingResult,
+    validate_feature_schema,
+    FeatureSchemaMismatchError,
+    load_training_result_metadata,
+)
 
 
 class ModelVersion:
@@ -28,7 +37,9 @@ class ModelVersion:
         feature_cols: Optional[List[str]] = None,
         training_samples: int = 0,
         config: Optional[Dict] = None,
-        metrics: Optional[Dict] = None
+        metrics: Optional[Dict] = None,
+        feature_schema: Optional[FeatureSchema] = None,
+        training_result: Optional[TrainingResult] = None,
     ):
         self.version = version
         self.model = model
@@ -40,6 +51,12 @@ class ModelVersion:
         self.config = config or {}
         self.metrics = metrics or {}
         self.created_at = datetime.now()
+        
+        # New: Feature schema for validation
+        self.feature_schema = feature_schema
+        
+        # New: Full training result metadata
+        self.training_result = training_result
     
     def is_effective_on(self, query_date: date) -> bool:
         """Check if this version is effective for a given date."""
@@ -49,9 +66,39 @@ class ModelVersion:
             return False
         return True
     
+    def get_feature_schema(self) -> Optional[FeatureSchema]:
+        """Get the feature schema for this version."""
+        if self.feature_schema:
+            return self.feature_schema
+        # Build schema from feature_cols if no explicit schema
+        if self.feature_cols:
+            return FeatureSchema(
+                feature_names=self.feature_cols,
+                feature_hash=FeatureSchema._compute_hash(self.feature_cols),
+                horizons=self.config.get('horizons', [20]),
+                created_date=self.trained_date,
+            )
+        return None
+    
+    def validate_features(self, current_features: List[str], strict: bool = True) -> Tuple[bool, List[str]]:
+        """
+        Validate current features against this version's schema.
+        
+        Args:
+            current_features: List of current feature names
+            strict: If True, require exact match
+            
+        Returns:
+            Tuple of (is_valid, list of issues)
+        """
+        schema = self.get_feature_schema()
+        if schema is None:
+            return True, []  # No schema to validate against
+        return schema.validate(current_features, strict=strict)
+    
     def to_dict(self) -> Dict:
         """Convert to dictionary (without model object)."""
-        return {
+        result = {
             'version': self.version,
             'trained_date': str(self.trained_date),
             'effective_start': str(self.effective_start),
@@ -62,6 +109,16 @@ class ModelVersion:
             'metrics': self.metrics,
             'created_at': self.created_at.isoformat()
         }
+        
+        # Include feature schema if available
+        if self.feature_schema:
+            result['feature_schema'] = self.feature_schema.to_dict()
+        
+        # Include training result metadata if available
+        if self.training_result:
+            result['training_result'] = self.training_result.to_dict()
+        
+        return result
 
 
 class ModelVersionManager:
@@ -173,7 +230,9 @@ class ModelVersionManager:
         feature_cols: List[str],
         training_samples: int,
         config: Optional[Dict] = None,
-        metrics: Optional[Dict] = None
+        metrics: Optional[Dict] = None,
+        feature_schema: Optional[FeatureSchema] = None,
+        training_result: Optional[TrainingResult] = None,
     ) -> int:
         """
         Save a new model version.
@@ -185,6 +244,8 @@ class ModelVersionManager:
             training_samples: Number of training samples used
             config: Training/model configuration
             metrics: Performance metrics
+            feature_schema: Optional FeatureSchema for validation
+            training_result: Optional TrainingResult with full metadata
             
         Returns:
             Version number assigned
@@ -199,6 +260,15 @@ class ModelVersionManager:
         if self.current_version is not None and self.current_version in self.versions:
             self.versions[self.current_version].effective_end = trained_date
         
+        # Build feature schema if not provided
+        if feature_schema is None and feature_cols:
+            feature_schema = FeatureSchema(
+                feature_names=feature_cols,
+                feature_hash=FeatureSchema._compute_hash(feature_cols),
+                horizons=config.get('horizons', [20]) if config else [20],
+                created_date=trained_date,
+            )
+        
         # Create new version
         model_version = ModelVersion(
             version=new_version,
@@ -209,7 +279,9 @@ class ModelVersionManager:
             feature_cols=feature_cols,
             training_samples=training_samples,
             config=config or {},
-            metrics=metrics or {}
+            metrics=metrics or {},
+            feature_schema=feature_schema,
+            training_result=training_result,
         )
         
         # Save model to disk
@@ -223,8 +295,16 @@ class ModelVersionManager:
             'feature_cols': feature_cols,
             'training_samples': training_samples,
             'config': config,
-            'metrics': metrics
+            'metrics': metrics,
         }
+        
+        # Include feature schema for validation
+        if feature_schema:
+            model_data['feature_schema'] = feature_schema.to_dict()
+        
+        # Include training result metadata
+        if training_result:
+            model_data['training_result'] = training_result.to_dict()
         
         with open(model_path, 'wb') as f:
             pickle.dump(model_data, f)
@@ -404,7 +484,9 @@ def save_live_model(
     feature_cols: List[str],
     training_samples: int,
     config: Optional[Dict] = None,
-    artifact_dir: str = "artifacts/models"
+    artifact_dir: str = "artifacts/models",
+    training_result: Optional[TrainingResult] = None,
+    horizons: Optional[List[int]] = None,
 ):
     """
     Save a model as the current live model.
@@ -418,9 +500,19 @@ def save_live_model(
         training_samples: Number of samples
         config: Training config
         artifact_dir: Artifact directory
+        training_result: Optional TrainingResult with full metadata
+        horizons: List of horizons (used for schema if training_result not provided)
     """
     artifact_dir = Path(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Build feature schema
+    feature_schema = FeatureSchema(
+        feature_names=feature_cols,
+        feature_hash=FeatureSchema._compute_hash(feature_cols),
+        horizons=horizons or [20],
+        created_date=trained_date,
+    )
     
     # Save as live model
     live_path = artifact_dir / "live_model.pkl"
@@ -431,8 +523,14 @@ def save_live_model(
         'feature_cols': feature_cols,
         'feature_count': len(feature_cols),
         'training_samples': training_samples,
-        'config': config
+        'config': config,
+        # New: Include feature schema for validation
+        'feature_schema': feature_schema.to_dict(),
     }
+    
+    # Include training result if provided
+    if training_result:
+        model_data['training_result'] = training_result.to_dict()
     
     with open(live_path, 'wb') as f:
         pickle.dump(model_data, f)
@@ -446,6 +544,65 @@ def save_live_model(
         trained_date=trained_date,
         feature_cols=feature_cols,
         training_samples=training_samples,
-        config=config
+        config=config,
+        feature_schema=feature_schema,
+        training_result=training_result,
     )
+
+
+def load_live_model_with_validation(
+    artifact_dir: str = "artifacts/models",
+    current_features: Optional[List[str]] = None,
+    strict_validation: bool = True,
+) -> Tuple[Any, Optional[FeatureSchema], List[str]]:
+    """
+    Load the live model with optional feature schema validation.
+    
+    Args:
+        artifact_dir: Directory containing model artifacts
+        current_features: List of current feature names to validate against
+        strict_validation: If True, require exact feature match
+        
+    Returns:
+        Tuple of (model, feature_schema, validation_issues)
+        
+    Raises:
+        FeatureSchemaMismatchError: If validation fails and strict_validation is True
+        FileNotFoundError: If model file doesn't exist
+    """
+    live_path = Path(artifact_dir) / "live_model.pkl"
+    
+    if not live_path.exists():
+        raise FileNotFoundError(f"Live model not found at {live_path}")
+    
+    with open(live_path, 'rb') as f:
+        model_data = pickle.load(f)
+    
+    model = model_data.get('model')
+    
+    # Load feature schema
+    feature_schema = None
+    if 'feature_schema' in model_data:
+        feature_schema = FeatureSchema.from_dict(model_data['feature_schema'])
+    elif 'feature_cols' in model_data:
+        # Build schema from legacy format
+        feature_schema = FeatureSchema(
+            feature_names=model_data['feature_cols'],
+            feature_hash=FeatureSchema._compute_hash(model_data['feature_cols']),
+            horizons=[model_data.get('horizon', 20)],
+            created_date=model_data.get('trained_date'),
+        )
+    
+    # Validate features if provided
+    validation_issues = []
+    if current_features and feature_schema:
+        is_valid, issues = feature_schema.validate(current_features, strict=strict_validation)
+        validation_issues = issues
+        
+        if not is_valid:
+            logger.warning(f"Feature schema validation failed: {'; '.join(issues)}")
+            if strict_validation:
+                raise FeatureSchemaMismatchError(issues)
+    
+    return model, feature_schema, validation_issues
 

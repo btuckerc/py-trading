@@ -12,6 +12,10 @@ import pickle
 import json
 from models.torch.losses import MultiHorizonLoss
 from models.splits import TimeSplit
+from models.tabular_trainer import (
+    TabularTrainer, TrainingConfig, TrainingResult, SamplingStrategy,
+    FeatureSchema, validate_feature_schema, FeatureSchemaMismatchError
+)
 
 
 # =============================================================================
@@ -24,6 +28,8 @@ class WalkForwardRetrainer:
     
     This class implements the retraining policy defined in configs/base.yaml,
     ensuring consistent behavior across backtests, simulations, and live trading.
+    
+    Now delegates training to TabularTrainer for consistency with other training paths.
     """
     
     def __init__(
@@ -62,12 +68,21 @@ class WalkForwardRetrainer:
         self.universe = universe
         self.horizon = horizon
         
+        # Initialize TabularTrainer for delegating training
+        self.tabular_trainer = TabularTrainer(
+            feature_pipeline=feature_pipeline,
+            label_generator=label_generator,
+            storage=storage,
+            api=api,
+        )
+        
         # State
         self.current_model = None
+        self.current_training_result: Optional[TrainingResult] = None
         self.last_train_date = None
         self.model_version = 0
         self.rolling_metrics = {}
-        self.model_history = []  # List of (date, model_path, metrics)
+        self.model_history = []  # List of (date, model_path, metrics, training_result)
     
     def get_model_for_date(self, as_of_date: date) -> Tuple[Any, bool]:
         """
@@ -99,14 +114,17 @@ class WalkForwardRetrainer:
         
         return self.current_model, False
     
+    def get_training_result(self) -> Optional[TrainingResult]:
+        """Get the TrainingResult from the most recent training."""
+        return self.current_training_result
+    
     def _train_model(self, as_of_date: date):
         """
         Train a new model using data up to as_of_date.
         
-        Uses time-decay weighting from the retraining config.
+        Delegates to TabularTrainer for the actual training logic.
         """
         from loguru import logger
-        from data.universe import TradingCalendar
         
         # Calculate training window
         window_start = self.config.get_window_start(as_of_date)
@@ -114,99 +132,43 @@ class WalkForwardRetrainer:
         
         logger.info(f"Training model on {window_start} to {train_end}")
         
-        # Generate labels
-        labels_df = self.label_generator.generate_labels(
-            start_date=window_start,
-            end_date=train_end,
+        # Build TrainingConfig from retraining config
+        training_config = TrainingConfig(
+            window_start=window_start,
+            window_end=train_end,
             horizons=[self.horizon],
+            sampling=SamplingStrategy(sample_every_n_days=5),
+            time_decay_enabled=self.config.time_decay.enabled,
+            time_decay_lambda=self.config.time_decay.lambda_,
+            time_decay_min_weight=self.config.time_decay.min_weight,
+            feature_lookback_days=252,
             benchmark_symbol="SPY",
-            universe=list(self.universe)
         )
         
-        if len(labels_df) == 0:
-            raise ValueError(f"No labels generated for {window_start} to {train_end}")
+        # Delegate to TabularTrainer
+        training_result = self.tabular_trainer.train(
+            model_class=self.model_class,
+            model_params=self.model_params,
+            config=training_config,
+            universe=self.universe,
+        )
         
-        # Build features for sampled training dates
-        calendar = TradingCalendar()
-        trading_days = calendar.get_trading_days(window_start, train_end)
-        train_dates = [d.date() for d in trading_days][::5]  # Sample every 5th day
-        
-        X_train_list = []
-        y_train_list = []
-        date_list = []  # Track dates for time-decay weighting
-        
-        for train_date in train_dates:
-            try:
-                features_df = self.feature_pipeline.build_features_cross_sectional(
-                    as_of_date=train_date,
-                    universe=self.universe,
-                    lookback_days=252
-                )
-                
-                if len(features_df) == 0:
-                    continue
-                
-                # Get labels for this date
-                date_labels = labels_df[labels_df['date'] == train_date]
-                if len(date_labels) == 0:
-                    continue
-                
-                # Merge
-                merged = features_df.merge(
-                    date_labels[['asset_id', 'target_excess_log_return']],
-                    on='asset_id',
-                    how='inner'
-                )
-                
-                if len(merged) == 0:
-                    continue
-                
-                # Extract features
-                feature_cols = [c for c in merged.columns 
-                               if c not in ['asset_id', 'date', 'target_excess_log_return']]
-                X = merged[feature_cols].copy()
-                for col in X.columns:
-                    X[col] = pd.to_numeric(X[col], errors='coerce')
-                X = X.fillna(0)
-                y = merged['target_excess_log_return'].values
-                
-                X_train_list.append(X)
-                y_train_list.append(y)
-                # Repeat date for each sample
-                date_list.extend([train_date] * len(merged))
-                
-            except Exception as e:
-                logger.debug(f"Skipping {train_date}: {e}")
-                continue
-        
-        if len(X_train_list) == 0:
-            raise ValueError("No training data generated")
-        
-        X_train = pd.concat(X_train_list, ignore_index=True)
-        y_train = np.concatenate(y_train_list)
-        
-        # Compute time-decay sample weights
-        sample_weights = self.config.compute_sample_weights(date_list, as_of_date)
-        sample_weights = np.array(sample_weights)
-        
-        logger.info(f"Training on {len(X_train)} samples with {len(X_train.columns)} features")
-        logger.info(f"Sample weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
-        
-        # Train model with sample weights
-        model = self.model_class(**self.model_params)
-        model.fit(X_train, y_train, sample_weight=sample_weights)
+        logger.info(f"Training on {training_result.num_samples} samples with {training_result.feature_count} features")
+        if training_result.sample_weight_range:
+            logger.info(f"Sample weight range: [{training_result.sample_weight_range[0]:.3f}, {training_result.sample_weight_range[1]:.3f}]")
         
         # Update state
-        self.current_model = model
+        self.current_model = training_result.model
+        self.current_training_result = training_result
         self.last_train_date = as_of_date
         self.model_version += 1
         
         # Save model if versioning enabled
         if self.config.versioning.enabled:
-            self._save_model_version(as_of_date, X_train.columns.tolist(), len(X_train))
+            self._save_model_version(as_of_date, training_result)
     
-    def _save_model_version(self, as_of_date: date, feature_cols: List[str], n_samples: int):
-        """Save a versioned model artifact."""
+    def _save_model_version(self, as_of_date: date, training_result: TrainingResult):
+        """Save a versioned model artifact with full training metadata."""
         from loguru import logger
         
         artifact_dir = Path(self.config.versioning.artifact_dir)
@@ -216,15 +178,27 @@ class WalkForwardRetrainer:
         version_str = as_of_date.strftime("%Y-%m-%d")
         model_path = artifact_dir / f"model_{version_str}.pkl"
         
+        # Build feature schema for validation
+        feature_schema = FeatureSchema(
+            feature_names=training_result.feature_names,
+            feature_hash=training_result.feature_hash,
+            horizons=training_result.horizons,
+            created_date=as_of_date,
+        )
+        
         model_data = {
             'model': self.current_model,
             'trained_date': as_of_date,
             'effective_start': as_of_date,
             'effective_end': None,  # Will be set when next version is trained
             'model_version': self.model_version,
-            'feature_cols': feature_cols,
-            'feature_count': len(feature_cols),
-            'training_samples': n_samples,
+            # Legacy fields for backwards compatibility
+            'feature_cols': training_result.feature_names,
+            'feature_count': training_result.feature_count,
+            'training_samples': training_result.num_samples,
+            # New structured metadata
+            'training_result': training_result.to_dict(),
+            'feature_schema': feature_schema.to_dict(),
             'config': {
                 'cadence_days': self.config.cadence_days,
                 'window_type': self.config.window_type,
@@ -251,8 +225,8 @@ class WalkForwardRetrainer:
             except Exception as e:
                 logger.warning(f"Could not update previous model version: {e}")
         
-        # Track in history
-        self.model_history.append((as_of_date, model_path, {}))
+        # Track in history with training result
+        self.model_history.append((as_of_date, model_path, {}, training_result))
         
         # Clean up old versions
         self._cleanup_old_versions()

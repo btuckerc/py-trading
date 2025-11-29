@@ -105,6 +105,11 @@ class EnsembleXGBoostModel(BaseModel):
     
     Trains multiple XGBoost models with different random seeds and
     uses the variance across predictions as uncertainty estimate.
+    
+    Supports:
+    - Sample weights for time-decay weighting
+    - Multi-horizon predictions via predict_multi_horizon
+    - Uncertainty estimation via predict_with_uncertainty
     """
     
     def __init__(
@@ -119,8 +124,17 @@ class EnsembleXGBoostModel(BaseModel):
         self.params = kwargs
         self.feature_names = None
     
-    def fit(self, X_train, y_train, X_val=None, y_val=None):
-        """Fit ensemble of XGBoost models."""
+    def fit(self, X_train, y_train, X_val=None, y_val=None, sample_weight=None):
+        """
+        Fit ensemble of XGBoost models.
+        
+        Args:
+            X_train: Training features
+            y_train: Training labels
+            X_val: Optional validation features
+            y_val: Optional validation labels
+            sample_weight: Optional array of sample weights (e.g., time-decay weights)
+        """
         if isinstance(X_train, pd.DataFrame):
             self.feature_names = X_train.columns.tolist()
             X_train = X_train.values
@@ -141,7 +155,12 @@ class EnsembleXGBoostModel(BaseModel):
                 model = xgb.XGBClassifier(**params)
             
             eval_set = [(X_val, y_val)] if X_val is not None else None
-            model.fit(X_train, y_train, eval_set=eval_set, verbose=False)
+            model.fit(
+                X_train, y_train, 
+                eval_set=eval_set, 
+                verbose=False,
+                sample_weight=sample_weight
+            )
             self.models.append(model)
     
     def predict(self, X) -> np.ndarray:
@@ -167,7 +186,29 @@ class EnsembleXGBoostModel(BaseModel):
         mean_pred = predictions.mean(axis=0)
         std_pred = predictions.std(axis=0)
         
+        # Ensure minimum uncertainty to avoid division by zero
+        std_pred = np.maximum(std_pred, 1e-6)
+        
         return mean_pred, std_pred
+    
+    def predict_quantiles(self, X, quantiles: List[float] = [0.1, 0.5, 0.9]) -> np.ndarray:
+        """
+        Predict quantiles from ensemble distribution.
+        
+        Args:
+            X: Features
+            quantiles: List of quantiles to compute (e.g., [0.1, 0.5, 0.9])
+            
+        Returns:
+            Array of shape (n_samples, n_quantiles)
+        """
+        if isinstance(X, pd.DataFrame):
+            X = X.values
+        
+        predictions = np.array([model.predict(X) for model in self.models])
+        
+        # Compute quantiles across ensemble
+        return np.percentile(predictions, [q * 100 for q in quantiles], axis=0).T
     
     def predict_proba(self, X):
         """Predict probabilities (for classification)."""

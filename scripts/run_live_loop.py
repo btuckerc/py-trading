@@ -46,7 +46,8 @@ from data.universe import TradingCalendar
 from data.maintenance import ensure_data_coverage, prepare_for_trading
 from labels.returns import ReturnLabelGenerator
 from labels.regimes import RegimeLabelGenerator
-from features.pipeline import FeaturePipeline, RegimeFeatureBuilder
+from features.pipeline import FeaturePipeline
+from features.regime_metrics import RegimeMetricsService
 from models.tabular import XGBoostModel, LightGBMModel
 from portfolio.strategies import LongTopKStrategy
 from portfolio.scores import ScoreConverter
@@ -110,7 +111,7 @@ def load_or_train_model(
     horizon: int = 20,
     train_days: int = 750,  # ~3 years
     force_retrain: bool = False,
-    expected_feature_count: int = None,
+    expected_features: list = None,  # Changed from expected_feature_count to full list
     use_retraining_policy: bool = True
 ) -> object:
     """
@@ -120,6 +121,7 @@ def load_or_train_model(
     - Determining if retraining is needed (cadence)
     - Time-decay sample weighting
     - Training window calculation
+    - Feature schema validation (names and order, not just count)
     
     Args:
         model_path: Path to model artifact
@@ -132,12 +134,17 @@ def load_or_train_model(
         horizon: Prediction horizon in days
         train_days: Number of days of training data (fallback if no policy)
         force_retrain: If True, retrain even if model exists
-        expected_feature_count: If provided, validate model has this many features
+        expected_features: If provided, validate model features against this list
         use_retraining_policy: If True, use config.retraining for cadence and weighting
     
     Returns:
         Trained model
     """
+    from models.tabular_trainer import (
+        TabularTrainer, TrainingConfig, SamplingStrategy, FeatureSchema,
+        validate_feature_schema, FeatureSchemaMismatchError
+    )
+    
     # Get retraining config
     retraining_config = None
     if use_retraining_policy and hasattr(config, 'retraining'):
@@ -158,13 +165,12 @@ def load_or_train_model(
                         model_date, training_end_date
                     )
                     if not should_retrain:
-                        # Validate feature count if provided
-                        if expected_feature_count is not None:
-                            model_feature_count = model_data.get('feature_count')
-                            if model_feature_count and model_feature_count != expected_feature_count:
+                        # Validate feature schema if expected_features provided
+                        if expected_features is not None:
+                            schema_issues = _validate_model_features(model_data, expected_features)
+                            if schema_issues:
                                 logger.warning(
-                                    f"Model feature count mismatch: model has {model_feature_count}, "
-                                    f"but current features have {expected_feature_count}. Retraining..."
+                                    f"Feature schema mismatch: {'; '.join(schema_issues)}. Retraining..."
                                 )
                             else:
                                 model_age_days = (training_end_date - model_date).days
@@ -182,13 +188,12 @@ def load_or_train_model(
                     retrain_frequency = config.live.get('retrain_frequency_days', 30) if hasattr(config, 'live') else 30
                     
                     if model_age_days <= retrain_frequency:
-                        # Validate feature count if provided
-                        if expected_feature_count is not None:
-                            model_feature_count = model_data.get('feature_count')
-                            if model_feature_count and model_feature_count != expected_feature_count:
+                        # Validate feature schema if expected_features provided
+                        if expected_features is not None:
+                            schema_issues = _validate_model_features(model_data, expected_features)
+                            if schema_issues:
                                 logger.warning(
-                                    f"Model feature count mismatch: model has {model_feature_count}, "
-                                    f"but current features have {expected_feature_count}. Retraining..."
+                                    f"Feature schema mismatch: {'; '.join(schema_issues)}. Retraining..."
                                 )
                             else:
                                 logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
@@ -200,134 +205,130 @@ def load_or_train_model(
                         logger.info(f"Model is {model_age_days} days old, retraining...")
         except Exception as e:
             logger.warning(f"Could not load model from {model_path}: {e}")
+
+
+def _validate_model_features(model_data: dict, expected_features: list) -> list:
+    """
+    Validate model features against expected features.
     
-    # Train new model
+    Returns list of issues (empty if valid).
+    """
+    from models.tabular_trainer import FeatureSchema
+    
+    # Try to get feature schema from model data
+    if 'feature_schema' in model_data:
+        schema = FeatureSchema.from_dict(model_data['feature_schema'])
+        is_valid, issues = schema.validate(expected_features, strict=True)
+        return issues if not is_valid else []
+    
+    # Fall back to feature_cols comparison
+    model_features = model_data.get('feature_cols', [])
+    if not model_features:
+        return []  # Can't validate without stored features
+    
+    # Build schema and validate
+    schema = FeatureSchema(
+        feature_names=model_features,
+        feature_hash=FeatureSchema._compute_hash(model_features),
+        horizons=[model_data.get('horizon', 20)],
+    )
+    is_valid, issues = schema.validate(expected_features, strict=True)
+    return issues if not is_valid else []
+    
+    # Train new model using TabularTrainer
     logger.info(f"Training new {model_type} model...")
     
     # Calculate training period using retraining config if available
     if retraining_config:
         training_start_date = retraining_config.get_window_start(training_end_date)
         logger.info(f"Using retraining policy: {retraining_config.window_type} window, {retraining_config.window_years} years")
+        time_decay_enabled = retraining_config.time_decay.enabled
+        time_decay_lambda = retraining_config.time_decay.lambda_
+        time_decay_min_weight = retraining_config.time_decay.min_weight
     else:
         training_start_date = (pd.Timestamp(training_end_date) - pd.Timedelta(days=train_days)).date()
+        time_decay_enabled = False
+        time_decay_lambda = 0.001
+        time_decay_min_weight = 0.1
     
-    # Generate labels
+    # Initialize components
     label_generator = ReturnLabelGenerator(storage)
-    labels_df = label_generator.generate_labels(
-        start_date=training_start_date,
-        end_date=training_end_date,
+    feature_pipeline = FeaturePipeline(api, config.features)
+    
+    # Build TrainingConfig
+    training_config = TrainingConfig(
+        window_start=training_start_date,
+        window_end=training_end_date,
         horizons=[horizon],
+        sampling=SamplingStrategy(sample_every_n_days=5),
+        time_decay_enabled=time_decay_enabled,
+        time_decay_lambda=time_decay_lambda,
+        time_decay_min_weight=time_decay_min_weight,
+        feature_lookback_days=252,
         benchmark_symbol="SPY",
-        universe=list(universe)
     )
     
-    if len(labels_df) == 0:
-        raise ValueError("No training labels generated")
+    # Initialize TabularTrainer
+    trainer = TabularTrainer(
+        feature_pipeline=feature_pipeline,
+        label_generator=label_generator,
+        storage=storage,
+        api=api,
+    )
     
-    # Build features
-    feature_pipeline = FeaturePipeline(api, config.features)
-    calendar = TradingCalendar()
-    
-    # Sample training dates (every 5th day for efficiency)
-    trading_days = calendar.get_trading_days(training_start_date, training_end_date)
-    train_dates = [d.date() for d in trading_days][::5]
-    
-    logger.info(f"Building features for {len(train_dates)} training dates...")
-    
-    X_train_list = []
-    y_train_list = []
-    date_list = []  # Track dates for time-decay weighting
-    
-    for train_date in train_dates:
-        try:
-            features_df = feature_pipeline.build_features_cross_sectional(
-                as_of_date=train_date,
-                universe=universe,
-                lookback_days=252
-            )
-            
-            if len(features_df) == 0:
-                continue
-            
-            # Get labels for this date
-            date_labels = labels_df[labels_df['date'] == train_date]
-            if len(date_labels) == 0:
-                continue
-            
-            # Merge
-            merged = features_df.merge(
-                date_labels[['asset_id', 'target_excess_log_return']],
-                on='asset_id',
-                how='inner'
-            )
-            
-            if len(merged) == 0:
-                continue
-            
-            # Extract features
-            feature_cols = [c for c in merged.columns if c not in ['asset_id', 'date', 'target_excess_log_return']]
-            X = merged[feature_cols].copy()
-            for col in X.columns:
-                X[col] = pd.to_numeric(X[col], errors='coerce')
-            X = X.fillna(0)
-            y = merged['target_excess_log_return'].values
-            
-            X_train_list.append(X)
-            y_train_list.append(y)
-            # Track dates for each sample
-            date_list.extend([train_date] * len(merged))
-            
-        except Exception as e:
-            continue
-    
-    if len(X_train_list) == 0:
-        raise ValueError("No training data generated")
-    
-    X_train = pd.concat(X_train_list, ignore_index=True)
-    y_train = np.concatenate(y_train_list)
-    
-    # Compute time-decay sample weights if using retraining policy
-    sample_weights = None
-    if retraining_config and retraining_config.time_decay.enabled:
-        sample_weights = retraining_config.compute_sample_weights(date_list, training_end_date)
-        sample_weights = np.array(sample_weights)
-        logger.info(f"Time-decay weighting enabled (lambda={retraining_config.time_decay.lambda_})")
-        logger.info(f"Sample weight range: [{sample_weights.min():.3f}, {sample_weights.max():.3f}]")
-    
-    logger.info(f"Training on {len(X_train)} samples with {len(X_train.columns)} features")
-    
-    # Train model with sample weights
-    logger.info(f"Initializing {model_type} model...")
+    # Determine model class and params
     if model_type == "xgboost":
-        model = XGBoostModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
+        model_class = XGBoostModel
+        model_params = {"task_type": "regression", "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
     elif model_type == "lightgbm":
-        model = LightGBMModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
+        model_class = LightGBMModel
+        model_params = {"task_type": "regression", "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
-    logger.info("Starting model.fit()...")
-    model.fit(X_train, y_train, sample_weight=sample_weights)
-    logger.info("Model training complete.")
+    # Train using TabularTrainer
+    training_result = trainer.train(
+        model_class=model_class,
+        model_params=model_params,
+        config=training_config,
+        universe=universe,
+    )
     
-    # Save model with retraining config info
+    logger.info(f"Training complete: {training_result.num_samples} samples, {training_result.feature_count} features")
+    if training_result.sample_weight_range:
+        logger.info(f"Sample weight range: [{training_result.sample_weight_range[0]:.3f}, {training_result.sample_weight_range[1]:.3f}]")
+    
+    # Build feature schema
+    feature_schema = FeatureSchema(
+        feature_names=training_result.feature_names,
+        feature_hash=training_result.feature_hash,
+        horizons=training_result.horizons,
+        created_date=training_end_date,
+    )
+    
+    # Save model with full metadata
     model_path.parent.mkdir(parents=True, exist_ok=True)
     model_data = {
-        'model': model,
+        'model': training_result.model,
         'trained_date': training_end_date,
         'effective_start': training_end_date,
         'effective_end': None,  # Will be set by next retrain
         'model_type': model_type,
         'horizon': horizon,
-        'feature_cols': list(X_train.columns),
-        'feature_count': len(X_train.columns),
-        'training_samples': len(X_train),
+        # Legacy fields for backwards compatibility
+        'feature_cols': training_result.feature_names,
+        'feature_count': training_result.feature_count,
+        'training_samples': training_result.num_samples,
         'config_hash': get_config_hash(dict(config.features)) if hasattr(config, 'features') else None,
+        # New structured metadata
+        'training_result': training_result.to_dict(),
+        'feature_schema': feature_schema.to_dict(),
         'retraining_config': {
             'cadence_days': retraining_config.cadence_days if retraining_config else None,
             'window_type': retraining_config.window_type if retraining_config else None,
             'window_years': retraining_config.window_years if retraining_config else None,
-            'time_decay_enabled': retraining_config.time_decay.enabled if retraining_config else False,
-            'time_decay_lambda': retraining_config.time_decay.lambda_ if retraining_config else None,
+            'time_decay_enabled': time_decay_enabled,
+            'time_decay_lambda': time_decay_lambda,
         }
     }
     
@@ -336,7 +337,7 @@ def load_or_train_model(
     
     logger.info(f"Model saved to {model_path}")
     
-    return model
+    return training_result.model
 
 
 def write_heartbeat(heartbeat_path: Path, status: str = "running"):
@@ -614,11 +615,11 @@ def main():
     # Initialize regime and exposure components
     regime_descriptor = "unknown"
     exposure_scale = 1.0
-    regime_builder = RegimeFeatureBuilder(api)
+    regime_metrics_service = RegimeMetricsService(api)
     
     # Always try to get current regime for display/logging (even if not using regime-aware features)
     try:
-        regime_id, regime_descriptor = regime_builder.get_current_regime(trading_date)
+        regime_id, regime_descriptor = regime_metrics_service.get_current_regime(trading_date)
         logger.info(f"Current market regime: {regime_descriptor}")
     except Exception as e:
         logger.debug(f"Could not determine regime: {e}")
@@ -655,8 +656,7 @@ def main():
         
         # Update volatility if vol scaling enabled
         if args.vol_scaling:
-            regime_features = regime_builder._get_raw_regime_features(trading_date)
-            realized_vol = regime_features.get('realized_vol_20d', 0.15)
+            realized_vol = regime_metrics_service.get_current_volatility(trading_date)
             exposure_manager.update_volatility(realized_vol)
             logger.info(f"Realized vol (20d): {realized_vol:.2%}")
         
@@ -704,36 +704,36 @@ def main():
     feature_pipeline = FeaturePipeline(api, config.features)
     
     # Check if model features match current feature pipeline
-    # Build a sample to get current feature count
+    # Build a sample to get current features
     sample_features = feature_pipeline.build_features_cross_sectional(trading_date, universe)
-    current_feature_count = len([c for c in sample_features.columns if c != 'asset_id'])
+    exclude_cols = {'asset_id', 'date'}
+    current_feature_names = sorted([c for c in sample_features.columns if c not in exclude_cols])
     
-    # Check model's expected feature count
-    model_feature_count = getattr(model, 'n_features_in_', None)
-    if model_feature_count is None:
-        # Try to get from booster for XGBoost
-        try:
-            model_feature_count = model.model.n_features_in_
-        except:
-            pass
-    
-    if model_feature_count and model_feature_count != current_feature_count:
-        logger.warning(
-            f"Feature mismatch detected: model expects {model_feature_count} features, "
-            f"but pipeline generates {current_feature_count}. Retraining model..."
-        )
-        # Retrain - let exceptions propagate so we know if it fails
-        model = load_or_train_model(
-            model_path=model_path,
-            model_type=args.model_type,
-            storage=storage,
-            api=api,
-            config=config,
-            training_end_date=(pd.Timestamp(trading_date) - pd.Timedelta(days=1)).date(),
-            universe=universe,
-            horizon=args.horizon,
-            force_retrain=True  # Force retrain due to feature mismatch
-        )
+    # Validate model features against current pipeline
+    # This catches schema drift (not just count, but names and order)
+    try:
+        with open(model_path, 'rb') as f:
+            model_data = pickle.load(f)
+        schema_issues = _validate_model_features(model_data, current_feature_names)
+        if schema_issues:
+            logger.warning(
+                f"Feature schema mismatch detected: {'; '.join(schema_issues[:3])}. Retraining model..."
+            )
+            # Retrain - let exceptions propagate so we know if it fails
+            model = load_or_train_model(
+                model_path=model_path,
+                model_type=args.model_type,
+                storage=storage,
+                api=api,
+                config=config,
+                training_end_date=(pd.Timestamp(trading_date) - pd.Timedelta(days=1)).date(),
+                universe=universe,
+                horizon=args.horizon,
+                force_retrain=True,  # Force retrain due to feature mismatch
+                expected_features=current_feature_names,
+            )
+    except Exception as e:
+        logger.debug(f"Could not validate model features: {e}")
     
     strategy = LongTopKStrategy(
         k=args.top_k,

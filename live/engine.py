@@ -7,7 +7,8 @@ from datetime import date, datetime, time
 from pathlib import Path
 import json
 from data.asof_api import AsOfQueryAPI
-from features.pipeline import FeaturePipeline, RegimeFeatureBuilder
+from features.pipeline import FeaturePipeline
+from features.regime_metrics import RegimeMetricsService, RegimeMetrics
 from portfolio.strategies import LongTopKStrategy
 from portfolio.scores import ScoreConverter
 from portfolio.risk import ExposureManager, DrawdownManager
@@ -57,8 +58,9 @@ class LiveEngine:
         self.exposure_manager = exposure_manager
         self.drawdown_manager = drawdown_manager
         
-        # Regime feature builder for getting current regime
-        self.regime_builder = RegimeFeatureBuilder(api)
+        # Regime metrics service for getting current regime and volatility
+        # This provides a clean public API instead of reaching into private methods
+        self.regime_metrics_service = RegimeMetricsService(api)
         
         # Logs directory
         self.logs_dir = Path(self.config.get('logs_dir', 'logs/live_trading'))
@@ -224,7 +226,15 @@ class LiveEngine:
     
     def _get_current_regime(self, trading_date: date) -> Tuple[int, str]:
         """Get current regime ID and descriptor."""
-        return self.regime_builder.get_current_regime(trading_date)
+        return self.regime_metrics_service.get_current_regime(trading_date)
+    
+    def get_regime_metrics(self, trading_date: date) -> RegimeMetrics:
+        """
+        Get full regime metrics for a trading date.
+        
+        This is the public API for accessing regime information.
+        """
+        return self.regime_metrics_service.get_regime_metrics(trading_date)
     
     def _compute_exposure_scale(self, trading_date: date, regime_descriptor: str) -> float:
         """
@@ -241,9 +251,8 @@ class LiveEngine:
         # Update regime
         self.exposure_manager.update_regime(regime_descriptor)
         
-        # Update volatility (get from regime features)
-        regime_features = self.regime_builder._get_raw_regime_features(trading_date)
-        realized_vol = regime_features.get('realized_vol_20d', 0.15)
+        # Update volatility using the public regime metrics service
+        realized_vol = self.regime_metrics_service.get_current_volatility(trading_date)
         self.exposure_manager.update_volatility(realized_vol)
         
         # Get drawdown scale
@@ -261,7 +270,11 @@ class LiveEngine:
         Supports:
         - Dict of sklearn/xgboost models (one per horizon)
         - Single sklearn/xgboost model
+        - EnsembleXGBoostModel with predict_with_uncertainty
         - PyTorch models with predict_mc
+        
+        Returns:
+            Dict mapping horizon -> (predictions, uncertainties)
         """
         # Extract feature columns (exclude asset_id, date)
         feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date']]
@@ -277,42 +290,130 @@ class LiveEngine:
             # Dict of models (one per horizon)
             predictions = {}
             for horizon, model in self.model.items():
-                if hasattr(model, 'predict'):
-                    # sklearn/xgboost style
-                    pred = model.predict(X)
-                    # Estimate uncertainty via ensemble or residual (simplified)
-                    sigma = np.ones(len(pred)) * 0.1  # Placeholder
-                    predictions[horizon] = (pred, sigma)
+                pred, sigma = self._predict_single_model(model, X)
+                predictions[horizon] = (pred, sigma)
             return predictions
-        elif hasattr(self.model, 'predict'):
-            # Single sklearn/xgboost model
-            pred = self.model.predict(X)
-            sigma = np.ones(len(pred)) * 0.1
-            return {20: (pred, sigma)}  # Default to 20d horizon
         else:
-            # PyTorch model
+            # Single model
+            pred, sigma = self._predict_single_model(self.model, X)
+            # Get horizon from config or default to 20
+            horizon = self.config.get('horizon', 20)
+            return {horizon: (pred, sigma)}
+    
+    def _predict_single_model(self, model, X: pd.DataFrame) -> tuple:
+        """
+        Make predictions from a single model with uncertainty estimation.
+        
+        Args:
+            model: Model to use for prediction
+            X: Feature DataFrame
+            
+        Returns:
+            Tuple of (predictions, uncertainties)
+        """
+        # Check for ensemble model with uncertainty support
+        if hasattr(model, 'predict_with_uncertainty'):
+            # EnsembleXGBoostModel or similar
+            pred, sigma = model.predict_with_uncertainty(X)
+            return pred, sigma
+        
+        # Check for sklearn/xgboost style model
+        if hasattr(model, 'predict'):
+            pred = model.predict(X)
+            
+            # Try to estimate uncertainty from model internals
+            sigma = self._estimate_uncertainty(model, X, pred)
+            return pred, sigma
+        
+        # PyTorch model
+        try:
             import torch
             X_tensor = torch.FloatTensor(X.values)
             
-            if hasattr(self.model, 'predict_mc'):
+            if hasattr(model, 'predict_mc'):
                 # MC dropout for uncertainty
-                predictions = self.model.predict_mc(X_tensor, n_samples=50)
+                mc_predictions = model.predict_mc(X_tensor, n_samples=50)
+                if isinstance(mc_predictions, dict):
+                    # Return first horizon's predictions
+                    first_horizon = list(mc_predictions.keys())[0]
+                    return mc_predictions[first_horizon]
+                return mc_predictions
             else:
                 # Standard prediction
-                self.model.eval()
+                model.eval()
                 with torch.no_grad():
-                    outputs = self.model(X_tensor)
-                    predictions = {h: (pred.cpu().numpy(), np.ones(len(pred)) * 0.1) 
-                                   for h, pred in outputs.items()}
+                    outputs = model(X_tensor)
+                    if isinstance(outputs, dict):
+                        first_horizon = list(outputs.keys())[0]
+                        pred = outputs[first_horizon].cpu().numpy()
+                    else:
+                        pred = outputs.cpu().numpy()
+                    sigma = np.ones(len(pred)) * 0.1
+                    return pred, sigma
+        except ImportError:
+            pass
+        
+        raise ValueError(f"Unknown model type: {type(model)}")
+    
+    def _estimate_uncertainty(self, model, X: pd.DataFrame, predictions: np.ndarray) -> np.ndarray:
+        """
+        Estimate prediction uncertainty for models without built-in uncertainty.
+        
+        Uses heuristics based on model type:
+        - XGBoost: Use feature importance variance or tree variance
+        - Other: Use a constant based on prediction variance
+        
+        Args:
+            model: The model
+            X: Features
+            predictions: Model predictions
             
-            return predictions
+        Returns:
+            Array of uncertainty estimates
+        """
+        n_samples = len(predictions)
+        
+        # Try to get uncertainty from XGBoost tree variance
+        if hasattr(model, 'model') and hasattr(model.model, 'get_booster'):
+            try:
+                booster = model.model.get_booster()
+                # Use prediction margin variance as uncertainty proxy
+                # This is a rough approximation
+                pred_std = np.std(predictions)
+                # Scale by prediction magnitude
+                sigma = np.abs(predictions - np.mean(predictions)) * 0.1 + pred_std * 0.05
+                sigma = np.maximum(sigma, 0.01)  # Minimum uncertainty
+                return sigma
+            except Exception:
+                pass
+        
+        # Default: use scaled prediction variance
+        pred_std = max(np.std(predictions), 0.01)
+        sigma = np.ones(n_samples) * pred_std * 0.5
+        return sigma
     
     def _predictions_to_scores(
         self,
         predictions: Dict,
         features_df: pd.DataFrame
     ) -> pd.DataFrame:
-        """Convert predictions to scores."""
+        """
+        Convert predictions to scores using config-driven multi-horizon blending.
+        
+        Uses MultiHorizonConfig from config if available, otherwise defaults.
+        """
+        from portfolio.scores import ScoreConverter, MultiHorizonConfig
+        
+        # Get multi-horizon config from config
+        multi_horizon_config = None
+        if 'multi_horizon' in self.config:
+            multi_horizon_config = MultiHorizonConfig.from_config(self.config['multi_horizon'])
+        elif 'portfolio' in self.config and 'multi_horizon' in self.config['portfolio']:
+            multi_horizon_config = MultiHorizonConfig.from_config(self.config['portfolio']['multi_horizon'])
+        
+        # Create converter (uses defaults if no config)
+        converter = ScoreConverter(config=multi_horizon_config)
+        
         scores = []
         
         for idx, row in features_df.iterrows():
@@ -323,12 +424,12 @@ class LiveEngine:
             for horizon, pred in predictions.items():
                 if isinstance(pred, tuple):
                     mu, sigma = pred
-                    pred_dict[horizon] = {'mu': mu[idx], 'sigma': sigma[idx]}
+                    pred_dict[horizon] = {'mu': float(mu[idx]), 'sigma': float(sigma[idx])}
                 else:
-                    pred_dict[horizon] = {'mu': pred[idx], 'sigma': 0.1}  # Default uncertainty
+                    pred_dict[horizon] = {'mu': float(pred[idx]), 'sigma': 0.1}  # Default uncertainty
             
-            # Combine scores
-            score = ScoreConverter.combine_multi_horizon_scores(pred_dict)
+            # Combine scores using config-driven converter
+            score = converter.combine_scores(pred_dict)
             
             # Compute confidence (from uncertainty)
             avg_uncertainty = np.mean([p['sigma'] for p in pred_dict.values()])

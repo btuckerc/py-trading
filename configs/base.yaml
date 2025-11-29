@@ -148,6 +148,34 @@ portfolio:
       market_neutral: true
       regime_aware: true
       disable_shorts_in_crisis: false  # Set true to disable shorts in bear_high_vol
+  
+  # Multi-horizon score blending configuration
+  # Controls how predictions from multiple horizons are combined into a single score
+  multi_horizon:
+    # Horizons to use (must match labels.horizons or a subset)
+    horizons: [5, 20]
+    
+    # Weights for each horizon (should sum to 1.0)
+    # More weight on 20d for swing trading, more on 5d for momentum
+    weights:
+      5: 0.4   # 40% weight on 5-day predictions
+      20: 0.6  # 60% weight on 20-day predictions
+    
+    # Combination method:
+    # - weighted_average: Simple weighted average of risk-adjusted scores
+    # - best_horizon: Pick horizon with highest risk-adjusted score
+    # - uncertainty_weighted: Weight by inverse uncertainty (more weight to confident predictions)
+    method: "weighted_average"
+    
+    # Risk adjustment method for individual horizon scores:
+    # - sharpe_like: score / sigma (Sharpe-style)
+    # - mean_variance: score - risk_aversion * sigma
+    # - rank_based: just use raw score (ranking happens later)
+    risk_adjustment: "sharpe_like"
+    
+    # Risk aversion parameter (only used if risk_adjustment = mean_variance)
+    risk_aversion: 1.0
+  
   risk:
     max_position_pct: 0.20      # Max 20% per position (prevents single-stock concentration)
     min_position_pct: 0.02      # Min 2% to avoid tiny positions
