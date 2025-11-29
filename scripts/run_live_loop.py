@@ -367,6 +367,7 @@ def main():
     
     # Comprehensive data preparation and validation
     # This handles: bootstrap, top-up, date adjustment, and sufficiency validation
+    # In force_mode, skip validation and just use whatever data is available
     logger.info("Preparing data for trading...")
     prep_result = prepare_for_trading(
         storage=storage,
@@ -374,7 +375,8 @@ def main():
         requested_date=requested_date,
         lookback_days=252,  # Feature lookback
         train_days=750,     # Training data requirement
-        auto_fetch=config.data.auto_fetch_on_live
+        auto_fetch=config.data.auto_fetch_on_live,
+        force_mode=args.force  # Skip validation in force mode
     )
     
     # Use the effective trading date from preparation
@@ -405,6 +407,10 @@ def main():
             )
         storage.close()
         sys.exit(1)  # Exit with error code for cron/scheduler to detect
+    
+    # Log bootstrap if it happened
+    if prep_result.get('bootstrapped'):
+        logger.info("Database was auto-bootstrapped with full historical data")
     
     logger.info(f"Data ready: {prep_result['coverage']['num_assets']} assets, "
                 f"data from {prep_result['coverage']['min_date']} to {prep_result['coverage']['max_date']}")

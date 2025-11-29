@@ -12,6 +12,11 @@
 # Force run (for testing/insights on weekends/holidays):
 #   docker-compose run --rm trading python scripts/run_live_loop.py --force --top-k 10
 #   # This bypasses trading-day and idempotency checks, runs in dry-run mode by default
+#
+# Bootstrap/check data (run this first on new deployments!):
+#   docker-compose run --rm trading python scripts/ensure_data_coverage.py --report
+#   docker-compose run --rm trading python scripts/ensure_data_coverage.py --mode full-history
+#   # This fetches ~6 years of historical data for all S&P 500 symbols (~190k bars)
 
 version: '3.8'
 

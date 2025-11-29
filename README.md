@@ -275,13 +275,61 @@ Max Drawdown:    -5.88%
 Win Rate:        62.3%
 ```
 
+## Docker Deployment
+
+The system is designed for zero-touch deployment. Just start the container and it handles everything:
+
+```bash
+# Start the scheduler (runs daily at 4:30 PM ET)
+docker-compose up -d trading-scheduler
+
+# Or run manually
+docker-compose run --rm trading
+```
+
+### Auto-Bootstrap
+
+**No manual data setup required.** When the container starts with an empty or sparse database:
+1. System detects missing data (< 100 bars per asset)
+2. Automatically fetches full historical data (2020-present, ~6 years)
+3. Builds universe membership from `data/sp500_constituents.csv`
+4. Proceeds with normal trading loop
+
+This takes 2-5 minutes on first run, then data is persisted in the `./data` volume.
+
+### Force Mode (Testing/Insights)
+
+Run anytime, including weekends/holidays, to see current recommendations:
+
+```bash
+# Get insights using most recent available data (no fetch attempts)
+docker-compose run --rm trading python scripts/run_live_loop.py --force --top-k 10
+
+# With all features enabled
+docker-compose run --rm trading python scripts/run_live_loop.py --force --top-k 10 \
+  --regime-aware --sector-tilts --vol-scaling
+```
+
+`--force` mode:
+- Uses whatever data is available (no fetch attempts on weekends)
+- Automatically runs in dry-run mode (no orders submitted)
+- Bypasses trading-day and idempotency checks
+- Perfect for checking "what would the model recommend today?"
+
+### Safety Features
+
+The system prevents duplicate orders automatically:
+- **Trading day check**: Skips execution on weekends/holidays
+- **Idempotency**: Won't run twice on the same trading day
+- **Force mode**: Always dry-run unless explicitly overridden
+
 ## Data Management
 
 Data coverage is managed automatically:
 
-- **Backtest/Live runs**: Auto-fetch missing data if `config.data.auto_fetch_on_backtest` / `auto_fetch_on_live` is true (default)
+- **Auto-bootstrap**: Empty databases are automatically populated with full history
+- **Daily top-up**: Missing recent data is fetched before each run
 - **Manual check**: `python scripts/ensure_data_coverage.py --report`
-- **Manual fetch**: `python scripts/ensure_data_coverage.py --mode full-history --auto-fetch`
 
 Configuration in `configs/base.yaml`:
 ```yaml

@@ -504,7 +504,15 @@ class DataMaintenanceManager:
         elif mode == "daily-top-up":
             # For daily top-up, use provided target_end or default to today
             effective_end = target_end or today
-            target_start = effective_end - timedelta(days=3)  # A few days buffer
+            
+            # On weekends/holidays, don't try to fetch the very latest data
+            # as vendors often have delays. Use the last completed trading day.
+            if not self.calendar.is_trading_day(effective_end):
+                # Find the last trading day
+                effective_end = self.calendar.previous_trading_day(effective_end)
+                logger.info(f"Non-trading day detected, targeting last trading day: {effective_end}")
+            
+            target_start = effective_end - timedelta(days=5)  # A few days buffer for holidays
             target_end = effective_end
         elif mode == "custom":
             if target_start is None:
@@ -849,7 +857,8 @@ def prepare_for_trading(
     requested_date: Optional[date] = None,
     lookback_days: int = 252,
     train_days: int = 750,
-    auto_fetch: bool = True
+    auto_fetch: bool = True,
+    force_mode: bool = False
 ) -> Dict[str, Any]:
     """
     Comprehensive preparation for live/paper trading.
@@ -861,6 +870,10 @@ def prepare_for_trading(
     3. Attempts to fetch missing data if auto_fetch is enabled
     4. Returns the effective trading date and data readiness status
     
+    AUTOMATIC BOOTSTRAP: If the database is empty or severely lacking data
+    (< 100 bars per asset when we expect ~1500), the system will automatically
+    fetch full historical data. No manual bootstrap command needed.
+    
     This is the main entry point for the live loop to call.
     
     Args:
@@ -870,6 +883,7 @@ def prepare_for_trading(
         lookback_days: Days of history needed for feature generation (default: 252)
         train_days: Days of history needed for model training (default: 750)
         auto_fetch: If True, automatically fetch missing data
+        force_mode: If True, skip validation and just use whatever data is available
     
     Returns:
         Dict with:
@@ -897,7 +911,8 @@ def prepare_for_trading(
         'issues': [],
         'warnings': [],
         'coverage': None,
-        'fetch_result': None
+        'fetch_result': None,
+        'bootstrapped': False
     }
     
     # Step 1: Determine the target trading date
@@ -918,6 +933,72 @@ def prepare_for_trading(
     coverage = manager.checker.get_current_coverage()
     result['coverage'] = coverage
     
+    # Step 3: Automatic bootstrap if needed
+    # Check if we need to bootstrap (empty DB or severely lacking data)
+    needs_bootstrap = False
+    bootstrap_reason = None
+    
+    if not coverage['has_data']:
+        needs_bootstrap = True
+        bootstrap_reason = "Database is empty"
+    elif coverage['num_assets'] > 0:
+        avg_bars = coverage['total_bars'] / coverage['num_assets']
+        # If we have less than 100 bars per asset, we need a full bootstrap
+        # (We expect ~1500 bars for 6 years of daily data)
+        if avg_bars < 100:
+            needs_bootstrap = True
+            bootstrap_reason = f"Insufficient data: only {avg_bars:.0f} bars per asset (need ~1500 for 6 years)"
+    
+    if needs_bootstrap and auto_fetch:
+        logger.warning(f"AUTO-BOOTSTRAP TRIGGERED: {bootstrap_reason}")
+        logger.info("Fetching full historical data (this may take a few minutes)...")
+        
+        fetch_result = manager.ensure_coverage(
+            mode="full-history",
+            target_end=target_date,
+            auto_fetch=True,
+            bootstrap_universe=True
+        )
+        result['fetch_result'] = fetch_result
+        result['bootstrapped'] = True
+        
+        # Re-check coverage
+        coverage = manager.checker.get_current_coverage()
+        result['coverage'] = coverage
+        
+        if coverage['has_data']:
+            logger.info(f"Bootstrap successful: {coverage['total_bars']:,} bars for {coverage['num_assets']} assets")
+        else:
+            result['issues'].append(f"Bootstrap failed: {fetch_result.get('message')}")
+            return result
+    elif needs_bootstrap and not auto_fetch:
+        result['issues'].append(f"{bootstrap_reason}. Run with auto_fetch=True to bootstrap.")
+        return result
+    
+    # For force_mode, skip all validation and just use available data
+    if force_mode:
+        if coverage['has_data']:
+            # Just use whatever data we have
+            data_date = coverage['max_date']
+            result['data_date'] = data_date
+            result['trading_date'] = data_date  # Use the last date with data
+            result['ready'] = True
+            
+            # Add informational warnings
+            if coverage['num_assets'] > 0:
+                avg_bars = coverage['total_bars'] / coverage['num_assets']
+                if avg_bars < lookback_days:
+                    result['warnings'].append(
+                        f"Limited data: {avg_bars:.0f} bars per asset (recommend {lookback_days}+)"
+                    )
+            
+            logger.info(f"FORCE MODE: Using available data as-of {data_date}")
+            return result
+        else:
+            result['issues'].append("No data available even for force mode")
+            return result
+    
+    # Normal validation flow continues below...
     if not coverage['has_data']:
         # No data at all - need full bootstrap
         result['issues'].append("No data in database - full bootstrap required")
@@ -1065,10 +1146,17 @@ def prepare_for_trading(
         min_required_bars = max(lookback_days, train_days // 5)  # Need at least lookback days per asset
         
         if avg_bars < min_required_bars:
-            result['warnings'].append(
-                f"Average {avg_bars:.0f} bars per asset may be insufficient "
-                f"(recommend at least {min_required_bars})"
-            )
+            if avg_bars < 50:
+                # Very few bars - likely needs full bootstrap
+                result['issues'].append(
+                    f"INSUFFICIENT DATA: Only {avg_bars:.0f} bars per asset (need {min_required_bars}+). "
+                    f"Run: python scripts/ensure_data_coverage.py --mode full-history --auto-fetch"
+                )
+            else:
+                result['warnings'].append(
+                    f"Average {avg_bars:.0f} bars per asset may be insufficient "
+                    f"(recommend at least {min_required_bars})"
+                )
     
     # Determine final readiness
     result['ready'] = len(result['issues']) == 0
