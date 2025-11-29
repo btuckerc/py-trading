@@ -16,7 +16,13 @@ Usage:
     python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --output-dir reports/
 
     # Generate HTML report
-    python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --html
+    python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --format html
+
+    # Generate PDF report
+    python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --format pdf
+
+    # Generate both HTML and PDF
+    python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --format all
 """
 
 import argparse
@@ -80,8 +86,12 @@ def parse_args():
         help="Base name for report files (default: auto-generated from dates)"
     )
     parser.add_argument(
+        "--format", type=str, choices=["text", "html", "pdf", "all"], default="text",
+        help="Output format: 'text' (default), 'html', 'pdf', or 'all' (html+pdf)"
+    )
+    parser.add_argument(
         "--html", action="store_true",
-        help="Generate HTML report in addition to images"
+        help="[DEPRECATED] Generate HTML report. Use --format html instead."
     )
     parser.add_argument(
         "--no-charts", action="store_true",
@@ -1127,6 +1137,25 @@ def generate_html_report(results: dict, metrics: dict, charts_dir: Path, output_
         f.write(html)
 
 
+def generate_pdf_report(html_path: Path, pdf_path: Path):
+    """Generate PDF report from HTML file using WeasyPrint."""
+    try:
+        from weasyprint import HTML
+    except ImportError:
+        print("Error: weasyprint is not installed. Install with: pip install weasyprint")
+        print("Skipping PDF generation.")
+        return False
+    
+    try:
+        # Convert HTML to PDF
+        # WeasyPrint handles relative image paths correctly when the base_url is set
+        HTML(filename=str(html_path), base_url=str(html_path.parent)).write_pdf(pdf_path)
+        return True
+    except Exception as e:
+        print(f"Error generating PDF: {e}")
+        return False
+
+
 def main():
     args = parse_args()
     
@@ -1134,6 +1163,13 @@ def main():
     if args.start_date and not args.end_date:
         print("Error: --end-date is required when using --start-date")
         sys.exit(1)
+    
+    # Determine effective format (handle backward compatibility with --html)
+    effective_format = args.format
+    if args.html and args.format == "text":
+        # Backward compatibility: --html sets format to html
+        effective_format = "html"
+        print("Warning: --html is deprecated. Use --format html instead.", file=sys.stderr)
     
     # Get results
     if args.from_json:
@@ -1195,11 +1231,27 @@ def main():
             
             print(f"Charts saved to: {output_dir}/")
             
-            # Generate HTML report
-            if args.html:
+            # Generate HTML and/or PDF reports based on format
+            needs_html = effective_format in ["html", "all"]
+            needs_pdf = effective_format in ["pdf", "all"]
+            
+            if needs_html or needs_pdf:
                 html_path = output_dir / f"{base_name}.html"
+                
+                # Generate HTML (required for PDF, optional standalone)
                 generate_html_report(results, metrics, output_dir, html_path)
-                print(f"HTML report saved to: {html_path}")
+                if needs_html:
+                    print(f"HTML report saved to: {html_path}")
+                
+                # Generate PDF (requires HTML to exist)
+                if needs_pdf:
+                    pdf_path = output_dir / f"{base_name}.pdf"
+                    if generate_pdf_report(html_path, pdf_path):
+                        print(f"PDF report saved to: {pdf_path}")
+    else:
+        # Charts disabled - warn if HTML/PDF requested
+        if effective_format in ["html", "pdf", "all"]:
+            print("\nWarning: HTML/PDF generation requires charts. Use --format without --no-charts.")
     
     print("\n✅ Report generation complete!")
 

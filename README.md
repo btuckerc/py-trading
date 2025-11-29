@@ -242,16 +242,22 @@ Run leakage-safe reports for recent periods (shortest to longest):
 
 ```bash
 # Run all three reports (week, month-to-date, year-to-date) with HTML output
-docker-compose run --rm trading python scripts/run_recent_reports.py --html
+docker-compose run --rm trading python scripts/run_recent_reports.py --format html
+
+# Run with PDF output
+docker-compose run --rm trading python scripts/run_recent_reports.py --format pdf
+
+# Run with both HTML and PDF
+docker-compose run --rm trading python scripts/run_recent_reports.py --format all
+
+# Run with specific initial capital ($10k and $100k variants) - PDF output
+docker-compose run --rm trading python scripts/run_recent_reports.py --capital-variants --format pdf
+
+# Run only specific periods
+docker-compose run --rm trading python scripts/run_recent_reports.py --periods week mtd --format html
 
 # Run without charts (faster, text/JSON only)
 docker-compose run --rm trading python scripts/run_recent_reports.py --no-charts
-
-# Run with specific initial capital ($10k and $100k variants)
-docker-compose run --rm trading python scripts/run_recent_reports.py --capital-variants --html
-
-# Run only specific periods
-docker-compose run --rm trading python scripts/run_recent_reports.py --periods week mtd --html
 ```
 
 ### Custom Date Ranges
@@ -261,11 +267,17 @@ docker-compose run --rm trading python scripts/run_recent_reports.py --periods w
 python scripts/simulate_daily_trading.py --start-date 2025-09-01 --end-date 2025-11-26
 
 # Generate charts and HTML report (shows all 3 benchmarks by default: SPY, DIA, QQQ)
-python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --html
+python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --format html
+
+# Generate PDF report
+python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --format pdf
+
+# Generate both HTML and PDF
+python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --format all
 
 # Generate report with specific benchmark(s)
-python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --benchmark sp500
-python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --benchmarks sp500,dow,nasdaq
+python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --benchmark sp500 --format pdf
+python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date 2025-11-26 --benchmarks sp500,dow,nasdaq --format pdf
 ```
 
 **Benchmarks:**
@@ -278,7 +290,8 @@ python scripts/generate_performance_report.py --start-date 2025-09-01 --end-date
 - `report_*.json` — Full data for programmatic use
 - `report_*_dashboard.png` — Single-page visual summary
 - `equity_curve.png`, `drawdown.png`, `monthly_returns.png` — Individual charts
-- `report_*.html` — Interactive HTML report
+- `report_*.html` — Interactive HTML report (when `--format html` or `--format all`)
+- `report_*.pdf` — PDF report (when `--format pdf` or `--format all`)
 
 **Sample metrics:**
 ```

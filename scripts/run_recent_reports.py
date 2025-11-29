@@ -7,7 +7,13 @@ It uses Python's datetime for cross-platform date calculations.
 
 Usage:
     # Run all three reports (week, MTD, YTD) with HTML output
-    python scripts/run_recent_reports.py --html
+    python scripts/run_recent_reports.py --format html
+
+    # Run with PDF output
+    python scripts/run_recent_reports.py --format pdf
+
+    # Run with both HTML and PDF
+    python scripts/run_recent_reports.py --format all
 
     # Run without charts (faster, text/JSON only)
     python scripts/run_recent_reports.py --no-charts
@@ -58,6 +64,12 @@ def run_report(period_name: str, start_date: date, end_date: date, args):
     print(f"Generating {period_name.upper()} report: {start_date} to {end_date}")
     print(f"{'='*80}\n")
     
+    # Determine effective format (handle backward compatibility with --html)
+    effective_format = args.format
+    if args.html and args.format == "text":
+        effective_format = "html"
+        print("Warning: --html is deprecated. Use --format html instead.", file=sys.stderr)
+    
     # Build command
     cmd = [
         sys.executable,
@@ -66,8 +78,8 @@ def run_report(period_name: str, start_date: date, end_date: date, args):
         "--end-date", str(end_date),
     ]
     
-    if args.html:
-        cmd.append("--html")
+    if effective_format != "text":
+        cmd.extend(["--format", effective_format])
     
     if args.no_charts:
         cmd.append("--no-charts")
@@ -130,6 +142,13 @@ def run_simulation_with_capital(period_name: str, start_date: date, end_date: da
     
     # Step 2: Generate report from JSON
     print(f"Step 2: Generating report from JSON...")
+    
+    # Determine effective format (handle backward compatibility with --html)
+    effective_format = args.format
+    if args.html and args.format == "text":
+        effective_format = "html"
+        print("Warning: --html is deprecated. Use --format html instead.", file=sys.stderr)
+    
     report_cmd = [
         sys.executable,
         "scripts/generate_performance_report.py",
@@ -137,8 +156,8 @@ def run_simulation_with_capital(period_name: str, start_date: date, end_date: da
         "--report-name", f"{period_name}_{int(initial_capital)}",
     ]
     
-    if args.html:
-        report_cmd.append("--html")
+    if effective_format != "text":
+        report_cmd.extend(["--format", effective_format])
     
     if args.no_charts:
         report_cmd.append("--no-charts")
@@ -167,8 +186,12 @@ def main():
         help="Which periods to run (default: all three)"
     )
     parser.add_argument(
+        "--format", type=str, choices=["text", "html", "pdf", "all"], default="text",
+        help="Output format: 'text' (default), 'html', 'pdf', or 'all' (html+pdf)"
+    )
+    parser.add_argument(
         "--html", action="store_true",
-        help="Generate HTML reports in addition to text/JSON"
+        help="[DEPRECATED] Generate HTML reports. Use --format html instead."
     )
     parser.add_argument(
         "--no-charts", action="store_true",

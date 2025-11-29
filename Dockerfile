@@ -9,6 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     libgomp1 \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libcairo2 \
+    libgdk-pixbuf2.0-0 \
+    shared-mime-info \
     && rm -rf /var/lib/apt/lists/*
 
 # Create virtual environment
@@ -23,9 +28,14 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Final stage
 FROM python:3.11-slim
 
-# Install runtime dependencies (libgomp for XGBoost/LightGBM)
+# Install runtime dependencies (libgomp for XGBoost/LightGBM, WeasyPrint dependencies)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libcairo2 \
+    libgdk-pixbuf2.0-0 \
+    shared-mime-info \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy virtual environment from builder
