@@ -197,17 +197,43 @@ class StorageBackend:
         return self.conn.execute(sql).df()
     
     def insert_dataframe(self, table_name: str, df: pd.DataFrame, if_exists: str = "append"):
-        """Insert DataFrame into DuckDB table."""
+        """
+        Insert DataFrame into DuckDB table.
+        
+        Args:
+            table_name: Name of the table to insert into
+            df: DataFrame to insert
+            if_exists: How to handle existing data:
+                - "append": Add new rows, skip duplicates (default)
+                - "replace": Delete all existing data first
+                - "upsert": Update existing rows, insert new ones
+        """
         if len(df) == 0:
             return
         
         if if_exists == "replace":
             self.conn.execute(f"DELETE FROM {table_name}")
         
-        # Register DataFrame as a temporary view and insert from it
+        # Register DataFrame as a temporary view
         self.conn.register('temp_df', df)
-        self.conn.execute(f"INSERT INTO {table_name} SELECT * FROM temp_df")
-        self.conn.unregister('temp_df')
+        
+        try:
+            if if_exists == "upsert" or if_exists == "append":
+                # For bars_daily, use INSERT OR REPLACE to handle duplicates
+                # This updates existing rows and inserts new ones
+                if table_name == "bars_daily":
+                    self.conn.execute(f"INSERT OR REPLACE INTO {table_name} SELECT * FROM temp_df")
+                else:
+                    # For other tables, try INSERT OR IGNORE to skip duplicates
+                    try:
+                        self.conn.execute(f"INSERT OR IGNORE INTO {table_name} SELECT * FROM temp_df")
+                    except Exception:
+                        # Fallback to regular insert if OR IGNORE not supported
+                        self.conn.execute(f"INSERT INTO {table_name} SELECT * FROM temp_df")
+            else:
+                self.conn.execute(f"INSERT INTO {table_name} SELECT * FROM temp_df")
+        finally:
+            self.conn.unregister('temp_df')
     
     def close(self):
         """Close DuckDB connection."""
