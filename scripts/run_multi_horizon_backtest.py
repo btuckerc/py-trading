@@ -462,12 +462,26 @@ def main():
             if 'asset_id' not in features_df.columns:
                 continue
             
-            # Extract features
-            feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date']]
-            X = features_df[feature_cols].copy()
+            # Extract features - use the same feature_cols from training to ensure consistency
+            # feature_cols was set during training and should be reused here
+            available_cols = [c for c in feature_cols if c in features_df.columns]
+            if len(available_cols) != len(feature_cols):
+                missing = set(feature_cols) - set(available_cols)
+                logger.debug(f"Missing {len(missing)} features for {backtest_date}: {list(missing)[:5]}...")
+            
+            # Only use features that were present during training
+            X = features_df[available_cols].copy()
             for col in X.columns:
                 X[col] = pd.to_numeric(X[col], errors='coerce')
             X = X.fillna(0)
+            
+            # Add missing columns as zeros to match training shape
+            for col in feature_cols:
+                if col not in X.columns:
+                    X[col] = 0.0
+            
+            # Reorder to match training column order
+            X = X[feature_cols]
             
             # Predict for all horizons
             if args.model_type in ["xgboost", "lightgbm"]:

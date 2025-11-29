@@ -609,6 +609,41 @@ def main():
     
     # Initialize components
     feature_pipeline = FeaturePipeline(api, config.features)
+    
+    # Check if model features match current feature pipeline
+    # Build a sample to get current feature count
+    try:
+        sample_features = feature_pipeline.build_features_cross_sectional(trading_date, universe)
+        current_feature_count = len([c for c in sample_features.columns if c != 'asset_id'])
+        
+        # Check model's expected feature count
+        model_feature_count = getattr(model, 'n_features_in_', None)
+        if model_feature_count is None:
+            # Try to get from booster for XGBoost
+            try:
+                model_feature_count = model.model.n_features_in_
+            except:
+                pass
+        
+        if model_feature_count and model_feature_count != current_feature_count:
+            logger.warning(
+                f"Feature mismatch detected: model expects {model_feature_count} features, "
+                f"but pipeline generates {current_feature_count}. Retraining model..."
+            )
+            model = load_or_train_model(
+                model_path=model_path,
+                model_type=args.model_type,
+                storage=storage,
+                api=api,
+                config=config,
+                training_end_date=(pd.Timestamp(trading_date) - pd.Timedelta(days=1)).date(),
+                universe=universe,
+                horizon=args.horizon,
+                force_retrain=True  # Force retrain due to feature mismatch
+            )
+    except Exception as e:
+        logger.warning(f"Could not validate feature count: {e}")
+    
     strategy = LongTopKStrategy(
         k=args.top_k,
         min_score_threshold=-np.inf,
