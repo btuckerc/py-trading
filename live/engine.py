@@ -128,6 +128,9 @@ class LiveEngine:
         # 5. Convert predictions to scores
         scores_df = self._predictions_to_scores(predictions, features_df)
         
+        # Count assets with positive scores (would be candidates if unrestricted)
+        positive_score_count = len(scores_df[scores_df['score'] > 0]) if 'score' in scores_df.columns else len(scores_df)
+        
         # 6. Compute target positions (with exposure scaling and sector tilts)
         current_positions = self._get_current_positions_dict()
         target_weights = self.strategy.compute_weights(
@@ -170,7 +173,9 @@ class LiveEngine:
             'target_positions': target_weights,
             'orders': orders,
             'orders_count': len(orders),
-            'dry_run': dry_run
+            'dry_run': dry_run,
+            'positive_score_count': positive_score_count,  # How many assets had positive scores (unrestricted candidates)
+            'universe_size': len(universe)
         }
     
     def _run_preflight_checks(self, trading_date: date) -> bool:

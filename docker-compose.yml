@@ -66,7 +66,8 @@ services:
         apt-get update && apt-get install -y cron
         
         # Create cron job for daily trading at 4:30 PM ET (21:30 UTC in winter, 20:30 UTC in summer)
-        echo "30 21 * * 1-5 cd /app && python scripts/run_live_loop.py --broker alpaca_paper --regime-aware --sector-tilts --vol-scaling --drawdown-throttle --top-k 10 --skip-if-logged --enable-alerts >> /app/logs/cron.log 2>&1" > /etc/cron.d/trading
+        # Broker and TOP_K are configured via env vars (set in .env file)
+        echo "30 21 * * 1-5 cd /app && python scripts/run_live_loop.py --regime-aware --sector-tilts --vol-scaling --drawdown-throttle --skip-if-logged --enable-alerts >> /app/logs/cron.log 2>&1" > /etc/cron.d/trading
         
         # Create cron job for weekly backtest on Sundays at 2 AM UTC
         echo "0 2 * * 0 cd /app && python scripts/run_backtest.py --start-date 2020-01-01 --end-date \$$(date +%Y-%m-%d) --model xgboost --horizon 20 --top-k 10 --run-benchmarks --auto-fetch >> /app/logs/weekly_backtest.log 2>&1" >> /etc/cron.d/trading

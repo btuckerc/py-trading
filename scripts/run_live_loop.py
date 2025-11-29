@@ -21,6 +21,7 @@ For scheduled cloud deployment:
 """
 
 import sys
+import os
 from pathlib import Path
 
 # Load environment variables from .env file
@@ -33,7 +34,6 @@ import numpy as np
 import json
 import pickle
 import hashlib
-import os
 import signal
 import time
 
@@ -306,7 +306,6 @@ def main():
     parser.add_argument("--model-path", type=str, help="Path to trained model (default: artifacts/models/live_model.pkl)")
     parser.add_argument("--model-type", type=str, default="xgboost", choices=["xgboost", "lightgbm"])
     parser.add_argument("--horizon", type=int, default=20, help="Prediction horizon (days)")
-    parser.add_argument("--top-k", type=int, default=10, help="Number of top assets to hold")
     parser.add_argument("--initial-capital", type=float, default=100000.0, help="Initial capital")
     parser.add_argument("--symbols", type=str, nargs="+", help="Symbols to trade (default: universe_membership)")
     parser.add_argument("--dry-run", action="store_true", help="Don't submit orders")
@@ -319,10 +318,16 @@ def main():
     parser.add_argument("--no-dry-run", action="store_true", 
                        help="Actually submit orders even with --force (use with caution!)")
     
-    # Broker selection
-    parser.add_argument("--broker", type=str, default="paper", 
+    # Broker selection - defaults to BROKER env var, then "paper"
+    default_broker = os.environ.get("BROKER", "paper")
+    parser.add_argument("--broker", type=str, default=default_broker, 
                        choices=["paper", "alpaca_paper", "alpaca_live"],
-                       help="Broker to use: paper (simulated), alpaca_paper (Alpaca paper trading), alpaca_live (Alpaca live)")
+                       help="Broker to use: paper (simulated), alpaca_paper (Alpaca paper trading), alpaca_live (Alpaca live). Can also set via BROKER env var.")
+    
+    # Top-K - defaults to TOP_K env var, then 10
+    default_top_k = int(os.environ.get("TOP_K", "10"))
+    parser.add_argument("--top-k", type=int, default=default_top_k, 
+                       help="Number of top-scoring assets to hold. Can also set via TOP_K env var.")
     
     # Regime-aware options
     parser.add_argument("--regime-aware", action="store_true", help="Enable regime-aware exposure scaling")
@@ -666,7 +671,6 @@ def main():
     elif args.broker == "alpaca_live":
         from live.alpaca_broker import AlpacaBroker
         # Safety check: require explicit environment variable for live trading
-        import os
         if os.environ.get("LIVE_TRADING_ENABLED") != "1":
             logger.error("Live trading requires LIVE_TRADING_ENABLED=1 environment variable")
             if args.enable_alerts and alert_manager:
@@ -733,11 +737,15 @@ def main():
         result_exposure = loop_results.get('exposure_scale', exposure_scale)
         result_orders = loop_results.get('orders_count', 0)
         result_targets = len(loop_results.get('target_positions', {}))
+        result_positive_scores = loop_results.get('positive_score_count', 0)
+        result_universe_size = loop_results.get('universe_size', 0)
     else:
         result_regime = regime_descriptor
         result_exposure = exposure_scale
         result_orders = 0
         result_targets = 0
+        result_positive_scores = 0
+        result_universe_size = 0
     
     # Print summary
     print("\n" + "="*60)
@@ -752,11 +760,12 @@ def main():
     print(f"Cash: ${broker.get_cash():,.2f}")
     print(f"Buying Power: ${broker.get_buying_power():,.2f}")
     if args.dry_run:
-        print(f"Target Positions: {result_targets}")
+        print(f"Target Positions: {result_targets} (top-k={args.top_k})")
         print(f"Orders (would submit): {result_orders}")
     else:
-        print(f"Positions: {len(broker.get_positions())}")
+        print(f"Positions: {len(broker.get_positions())} (top-k={args.top_k})")
         print(f"Orders Submitted: {result_orders}")
+    print(f"Positive Scores: {result_positive_scores}/{result_universe_size} assets")
     
     if args.regime_aware:
         print(f"\nRegime-Aware Features:")
