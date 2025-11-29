@@ -216,4 +216,17 @@ class PaperBroker(BrokerAPI):
             total_value += market_value
         
         return total_value
+    
+    def get_cash(self) -> float:
+        """Get cash balance."""
+        return self.cash
+    
+    def get_buying_power(self) -> float:
+        """
+        Get available buying power.
+        
+        For PaperBroker, this defaults to cash (no margin).
+        Can be extended to support leverage factor if needed.
+        """
+        return self.cash
 

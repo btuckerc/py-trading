@@ -648,234 +648,34 @@ def main():
     if heartbeat_path:
         write_heartbeat(heartbeat_path, "running")
     
-    # Build features
-    logger.info(f"Building features as-of {trading_date}...")
-    features_df = feature_pipeline.build_features_cross_sectional(
-        as_of_date=trading_date,
-        universe=universe,
-        lookback_days=252
+    # Create LiveEngine instance with all components
+    engine = LiveEngine(
+        api=api,
+        feature_pipeline=feature_pipeline,
+        model=model,
+        strategy=strategy,
+        broker=broker,
+        config=config.__dict__,
+        asset_id_to_symbol=asset_id_to_symbol,
+        exposure_manager=exposure_manager,
+        drawdown_manager=drawdown_manager
     )
     
-    if len(features_df) == 0:
-        logger.error("No features generated")
-        storage.close()
-        sys.exit(1)
-    
-    logger.info(f"Generated features for {len(features_df)} assets")
-    
-    # Prepare features
-    feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date']]
-    X = features_df[feature_cols].copy()
-    for col in X.columns:
-        X[col] = pd.to_numeric(X[col], errors='coerce')
-    X = X.fillna(0)
-    
-    current_feature_count = X.shape[1]
-    logger.info(f"Current feature count: {current_feature_count}")
-    
-    # Check if model features match current features
-    # Get expected feature count from model if available
+    # Run the daily loop (this handles features, predictions, position-aware rebalancing, orders, and logging)
     try:
-        if hasattr(model, 'n_features_in_'):
-            model_feature_count = model.n_features_in_
-        elif hasattr(model, 'model') and hasattr(model.model, 'n_features_in_'):
-            model_feature_count = model.model.n_features_in_
-        else:
-            model_feature_count = None
-        
-        if model_feature_count and model_feature_count != current_feature_count:
-            logger.warning(
-                f"Feature mismatch: model expects {model_feature_count} features, "
-                f"but current data has {current_feature_count}. Retraining model..."
-            )
-            
-            # Retrain with current features
-            model = load_or_train_model(
-                model_path=model_path,
-                model_type=args.model_type,
-                storage=storage,
-                api=api,
-                config=config,
-                training_end_date=(pd.Timestamp(trading_date) - pd.Timedelta(days=1)).date(),
-                universe=universe,
-                horizon=args.horizon,
-                force_retrain=True,  # Force retrain due to feature mismatch
-                expected_feature_count=current_feature_count
-            )
-            logger.info("Model retrained successfully with current features")
+        engine.run_daily_loop(trading_date, dry_run=args.dry_run, universe=universe)
     except Exception as e:
-        logger.warning(f"Could not validate feature count: {e}")
-    
-    # Generate predictions
-    logger.info("Generating predictions...")
-    try:
-        predictions = model.predict(X)
-    except ValueError as e:
-        if "Feature shape mismatch" in str(e) or "feature" in str(e).lower():
-            logger.error(f"Feature mismatch error: {e}")
-            logger.info("Attempting to retrain model with current features...")
-            
-            model = load_or_train_model(
-                model_path=model_path,
-                model_type=args.model_type,
-                storage=storage,
-                api=api,
-                config=config,
-                training_end_date=(pd.Timestamp(trading_date) - pd.Timedelta(days=1)).date(),
-                universe=universe,
-                horizon=args.horizon,
-                force_retrain=True,
-                expected_feature_count=current_feature_count
+        logger.error(f"Error in daily loop: {e}")
+        if args.enable_alerts and alert_manager:
+            alert_manager.send_error_alert(
+                error_type="Daily Loop Execution",
+                error_message=str(e),
+                context={"trading_date": str(trading_date)}
             )
-            predictions = model.predict(X)
-            logger.info("Model retrained and predictions generated successfully")
-        else:
-            raise
+        raise
     
-    # Create scores DataFrame
-    scores_df = pd.DataFrame({
-        'asset_id': features_df['asset_id'].values,
-        'score': predictions,
-        'confidence': np.ones(len(predictions)) * 0.8
-    })
-    
-    # Check for shutdown request
-    if shutdown_requested:
-        logger.warning("Shutdown requested, aborting before order generation")
-        storage.close()
-        return
-    
-    # Compute target weights (with regime-aware exposure and sector tilts)
-    logger.info("Computing portfolio weights...")
-    target_weights_df = strategy.compute_weights(
-        scores_df,
-        as_of_date=trading_date,
-        exposure_scale=exposure_scale,
-        current_regime=regime_descriptor
-    )
-    
-    if len(target_weights_df) == 0:
-        logger.warning("No target positions generated")
-        storage.close()
-        return
-    
-    logger.info(f"Target positions: {len(target_weights_df)} assets")
-    
-    # Print target allocations
-    logger.info("Target allocations:")
-    for _, row in target_weights_df.iterrows():
-        symbol = asset_id_to_symbol.get(row['asset_id'], f"Asset_{row['asset_id']}")
-        logger.info(f"  {symbol}: {row['weight']*100:.1f}%")
-    
-    # Generate orders
-    orders = []
-    account_value = broker.get_account_value()
-    
-    for _, row in target_weights_df.iterrows():
-        asset_id = row['asset_id']
-        target_weight = row['weight']
-        symbol = asset_id_to_symbol.get(asset_id)
-        
-        if not symbol:
-            logger.warning(f"No symbol mapping for asset_id {asset_id}")
-            continue
-        
-        quote = broker.get_quote(symbol)
-        price = quote['last']
-        
-        if price <= 0:
-            logger.warning(f"Invalid price for {symbol}")
-            continue
-        
-        target_value = account_value * target_weight
-        shares = int(target_value / price)
-        
-        if shares > 0:
-            orders.append({
-                'symbol': symbol,
-                'side': 'buy',
-                'quantity': shares,
-                'order_type': 'market',
-                'time_in_force': 'day'
-            })
-    
-    logger.info(f"Generated {len(orders)} orders")
-    
-    # Submit orders
-    if args.dry_run:
-        logger.info("DRY RUN MODE - Orders not submitted")
-        for order in orders:
-            logger.info(f"  Would {order['side']} {order['quantity']} {order['symbol']}")
-    else:
-        logger.info("Submitting orders...")
-        submitted_orders = []
-        for order in orders:
-            try:
-                order_id = broker.submit_order(
-                    symbol=order['symbol'],
-                    side=order['side'],
-                    quantity=order['quantity'],
-                    order_type=order['order_type'],
-                    time_in_force=order['time_in_force']
-                )
-                logger.info(f"  Submitted: {order['side']} {order['quantity']} {order['symbol']} (ID: {order_id})")
-                submitted_orders.append({**order, 'order_id': order_id, 'status': 'submitted'})
-            except Exception as e:
-                logger.error(f"  Failed: {order['symbol']} - {e}")
-                submitted_orders.append({**order, 'error': str(e), 'status': 'failed'})
-    
-    # Save log
-    log_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Get exposure manager state if available
-    exposure_state = {}
-    if exposure_manager:
-        exposure_state = exposure_manager.get_state()
-    
-    # Get drawdown state if available
-    drawdown_state = {}
-    if drawdown_manager:
-        drawdown_state = {
-            'current_drawdown': drawdown_manager.get_current_drawdown(broker.get_account_value()),
-            'is_throttled': drawdown_manager.is_throttled,
-            'scale_factor': drawdown_manager.current_scale_factor,
-        }
-    
-    daily_log = {
-        'trading_date': str(trading_date),
-        'timestamp': datetime.now().isoformat(),
-        'model_type': args.model_type,
-        'model_path': str(model_path),
-        'horizon': args.horizon,
-        'top_k': args.top_k,
-        'universe_size': len(universe),
-        'features_generated': len(features_df),
-        
-        # Regime and exposure info
-        'regime': {
-            'descriptor': regime_descriptor,
-            'exposure_scale': exposure_scale,
-        },
-        'exposure_state': exposure_state,
-        'drawdown_state': drawdown_state,
-        'regime_aware_enabled': args.regime_aware,
-        'sector_tilts_enabled': args.sector_tilts,
-        'vol_scaling_enabled': args.vol_scaling,
-        'drawdown_throttle_enabled': args.drawdown_throttle,
-        
-        # Positions and orders
-        'target_positions': target_weights_df.to_dict('records') if len(target_weights_df) > 0 else [],
-        'orders': submitted_orders if not args.dry_run else [{'dry_run': True, **o} for o in orders],
-        'account_value': broker.get_account_value(),
-        'cash': broker.cash,
-        'positions': broker.get_positions(),
-        'config_hash': get_config_hash(dict(config.features)) if hasattr(config, 'features') else None
-    }
-    
-    with open(log_file, 'w') as f:
-        json.dump(daily_log, f, indent=2, default=str)
-    
-    logger.info(f"Log saved to {log_file}")
+    # Daily loop completed - LiveEngine handles features, predictions, position-aware rebalancing, orders, and logging
+    # The detailed JSON log is saved by LiveEngine._log_daily_results
     
     # Update heartbeat with completion
     if heartbeat_path:
@@ -891,9 +691,9 @@ def main():
     print(f"Regime: {regime_descriptor}")
     print(f"Exposure Scale: {exposure_scale:.0%}")
     print(f"Account Value: ${broker.get_account_value():,.2f}")
-    print(f"Cash: ${broker.cash:,.2f}")
+    print(f"Cash: ${broker.get_cash():,.2f}")
+    print(f"Buying Power: ${broker.get_buying_power():,.2f}")
     print(f"Positions: {len(broker.get_positions())}")
-    print(f"Orders: {len(orders)}")
     
     if args.regime_aware:
         print(f"\nRegime-Aware Features:")
@@ -912,7 +712,7 @@ def main():
             exposure_scale=exposure_scale,
             account_value=broker.get_account_value(),
             positions=len(broker.get_positions()),
-            orders=len(orders),
+            orders=0,  # Order details are logged by LiveEngine
             additional_metrics={
                 "Mode": "DRY RUN" if args.dry_run else "LIVE",
                 "Model": args.model_type,

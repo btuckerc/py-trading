@@ -9,6 +9,39 @@ class BrokerAPI(ABC):
     """Abstract base class for broker interfaces."""
     
     @abstractmethod
+    def get_account_value(self) -> float:
+        """
+        Get total account value (equity).
+        
+        Returns:
+            Total account equity (cash + positions value)
+        """
+        pass
+    
+    @abstractmethod
+    def get_cash(self) -> float:
+        """
+        Get cash balance.
+        
+        Returns:
+            Available cash balance
+        """
+        pass
+    
+    @abstractmethod
+    def get_buying_power(self) -> float:
+        """
+        Get available buying power.
+        
+        For simple brokers, this can default to get_cash().
+        For margin accounts, this may be higher than cash.
+        
+        Returns:
+            Available buying power
+        """
+        pass
+    
+    @abstractmethod
     def get_positions(self) -> List[Dict]:
         """
         Get current positions.

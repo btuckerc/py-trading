@@ -1247,6 +1247,23 @@ def prepare_for_trading(
                     f"(recommend at least {min_required_bars})"
                 )
     
+    # Step 8: Ensure regimes table exists (needed for regime features)
+    # This is checked separately because regimes might be missing even if data is complete
+    try:
+        regimes_count = manager.storage.query("SELECT COUNT(*) as cnt FROM regimes")
+        regimes_exist = regimes_count['cnt'].iloc[0] > 0
+    except Exception:
+        regimes_exist = False
+    
+    if not regimes_exist and coverage['has_data']:
+        logger.info("Regimes table missing - bootstrapping regime model...")
+        try:
+            manager._bootstrap_regimes()
+            result['regimes_bootstrapped'] = True
+        except Exception as e:
+            # Regimes are nice-to-have, not critical - just warn
+            logger.warning(f"Could not bootstrap regimes (non-fatal): {e}")
+    
     # Determine final readiness
     result['ready'] = len(result['issues']) == 0
     

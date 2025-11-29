@@ -2,7 +2,7 @@
 
 import pandas as pd
 import numpy as np
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Set
 from datetime import date, datetime, time
 from pathlib import Path
 import json
@@ -72,7 +72,7 @@ class LiveEngine:
         except Exception:
             return {}
     
-    def run_daily_loop(self, trading_date: date, dry_run: bool = False):
+    def run_daily_loop(self, trading_date: date, dry_run: bool = False, universe: Optional[Set[int]] = None):
         """
         Run daily trading loop.
         
@@ -81,6 +81,7 @@ class LiveEngine:
         Args:
             trading_date: The trading date to run for
             dry_run: If True, don't submit orders (for testing)
+            universe: Optional pre-computed universe. If None, will fetch from API.
         """
         logger.info(f"Running daily loop for {trading_date}")
         
@@ -90,7 +91,8 @@ class LiveEngine:
             return
         
         # 1. Get latest data
-        universe = self.api.get_universe_at_date(trading_date)
+        if universe is None:
+            universe = self.api.get_universe_at_date(trading_date)
         logger.info(f"Universe size: {len(universe)}")
         
         # 2. Get current regime and update exposure manager
@@ -145,6 +147,7 @@ class LiveEngine:
         # 9. Log results
         self._log_daily_results(
             trading_date, predictions, target_weights, orders,
+            current_positions=current_positions,
             regime_descriptor=regime_descriptor, exposure_scale=exposure_scale
         )
     
@@ -412,6 +415,38 @@ class LiveEngine:
                 'current_weight': current_weight
             })
         
+        # Check buying power constraint and scale buy orders if needed
+        buying_power = self.broker.get_buying_power()
+        safety_factor = self.config.get('buying_power_safety_factor', 0.98)  # Use 98% of buying power as safety margin
+        
+        # Calculate total buy notional
+        total_buy_notional = 0.0
+        buy_orders = [o for o in orders if o['side'] == 'buy']
+        
+        for order in buy_orders:
+            quote = self.broker.get_quote(order['symbol'])
+            price = quote['last']
+            if price > 0:
+                total_buy_notional += order['quantity'] * price
+        
+        # Scale down buy orders if they exceed buying power
+        max_buy_notional = buying_power * safety_factor
+        if total_buy_notional > max_buy_notional and total_buy_notional > 0:
+            scale_factor = max_buy_notional / total_buy_notional
+            logger.warning(
+                f"Buy orders exceed buying power: ${total_buy_notional:,.2f} > ${max_buy_notional:,.2f}. "
+                f"Scaling down buy orders by {scale_factor:.2%}"
+            )
+            
+            # Scale down all buy orders
+            for order in buy_orders:
+                original_qty = order['quantity']
+                order['quantity'] = max(1, int(original_qty * scale_factor))  # At least 1 share
+                if order['quantity'] != original_qty:
+                    logger.debug(
+                        f"Scaled {order['symbol']}: {original_qty} -> {order['quantity']} shares"
+                    )
+        
         return orders
     
     def _log_daily_results(
@@ -420,6 +455,7 @@ class LiveEngine:
         predictions: Dict,
         target_weights: pd.DataFrame,
         orders: List[Dict],
+        current_positions: Optional[Dict[int, float]] = None,
         regime_descriptor: str = "unknown",
         exposure_scale: float = 1.0
     ):
@@ -451,6 +487,8 @@ class LiveEngine:
             'trading_date': trading_date.isoformat(),
             'timestamp': datetime.now().isoformat(),
             'account_value': self.broker.get_account_value(),
+            'cash': self.broker.get_cash(),
+            'buying_power': self.broker.get_buying_power(),
             'regime': {
                 'descriptor': regime_descriptor,
                 'exposure_scale': exposure_scale,
@@ -464,6 +502,14 @@ class LiveEngine:
                 }
                 for h, p in predictions.items()
             },
+            'current_positions': [
+                {
+                    'asset_id': asset_id,
+                    'symbol': self.asset_id_to_symbol.get(asset_id, f"Asset_{asset_id}"),
+                    'weight': weight
+                }
+                for asset_id, weight in (current_positions.items() if current_positions else {})
+            ],
             'target_weights': target_weights.to_dict('records') if len(target_weights) > 0 else [],
             'orders': [
                 {k: (v.isoformat() if isinstance(v, (date, datetime)) else v)
