@@ -40,6 +40,7 @@ ENV/
 data/raw_vendor/
 data/normalized/
 *.duckdb
+*.duckdb.*
 *.parquet
 *.csv
 !data/sp500_constituents.csv

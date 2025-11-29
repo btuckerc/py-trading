@@ -171,6 +171,29 @@ class DataCoverageChecker:
                 result['missing_symbols'] = symbols
             return result
         
+        # Check for sparse data - if we have very few bars relative to the date range,
+        # we should treat this as needing a full refetch rather than just filling edges.
+        # This catches cases where a partial/failed fetch left scattered data points.
+        if coverage['num_assets'] > 0:
+            avg_bars_per_asset = coverage['total_bars'] / coverage['num_assets']
+            expected_trading_days = (max_date - min_date).days * 252 / 365  # Rough estimate
+            # If we're missing more than 10% of expected data, treat as sparse
+            # This is aggressive because partial data is worse than no data for training
+            if expected_trading_days > 100 and avg_bars_per_asset < expected_trading_days * 0.9:
+                # Data is sparse (less than 90% of expected days)
+                # Treat as needing full refetch from target_start to target_end
+                coverage_pct = (avg_bars_per_asset / expected_trading_days) * 100
+                logger.warning(
+                    f"Sparse data detected: {avg_bars_per_asset:.0f} bars/asset "
+                    f"({coverage_pct:.1f}% of ~{expected_trading_days:.0f} expected trading days). "
+                    f"Triggering full refetch."
+                )
+                result['needs_backfill'] = True
+                result['backfill_ranges'] = [(target_start, target_end)]
+                if symbols:
+                    result['missing_symbols'] = symbols
+                return result
+        
         # Check for gaps at the start
         if target_start < min_date:
             result['needs_backfill'] = True
@@ -466,7 +489,8 @@ class DataMaintenanceManager:
         symbols: Optional[List[str]] = None,
         vendor: Optional[str] = None,
         auto_fetch: bool = True,
-        bootstrap_universe: bool = True
+        bootstrap_universe: bool = True,
+        force_full_refetch: bool = False
     ) -> Dict[str, Any]:
         """
         Ensure data coverage for the specified mode and date range.
@@ -482,6 +506,8 @@ class DataMaintenanceManager:
             vendor: Data vendor to use (if None, uses config default)
             auto_fetch: If True, automatically fetch missing data
             bootstrap_universe: If True, build universe_membership after fetching data for empty DB
+            force_full_refetch: If True, treat all symbols as missing and fetch full history
+                               (useful when existing data is insufficient)
         
         Returns:
             Dict with status, gaps identified, and fetch results
@@ -542,8 +568,21 @@ class DataMaintenanceManager:
         # Check current coverage
         result['coverage_before'] = self.checker.get_current_coverage()
         
-        # Identify gaps
-        gaps = self.checker.identify_gaps(target_start, target_end, symbols)
+        # If force_full_refetch is True, treat ALL symbols as missing
+        # This is useful when the database has some data but it's insufficient
+        if force_full_refetch:
+            logger.info(f"Force full refetch enabled - treating all {len(symbols)} symbols as missing")
+            gaps = {
+                'needs_backfill': True,
+                'backfill_ranges': [],  # No gap ranges, we'll fetch full history for all
+                'missing_symbols': symbols,  # Treat ALL symbols as missing
+                'partial_symbols': {},
+                'coverage': result['coverage_before']
+            }
+        else:
+            # Identify gaps normally
+            gaps = self.checker.identify_gaps(target_start, target_end, symbols)
+        
         result['gaps'] = gaps
         result['gaps_identified'] = gaps['needs_backfill']
         
@@ -819,7 +858,8 @@ def ensure_data_coverage(
     target_end: Optional[date] = None,
     symbols: Optional[List[str]] = None,
     vendor: Optional[str] = None,
-    auto_fetch: bool = True
+    auto_fetch: bool = True,
+    force_full_refetch: bool = False
 ) -> Dict[str, Any]:
     """
     Convenience function to ensure data coverage.
@@ -835,6 +875,7 @@ def ensure_data_coverage(
         symbols: List of symbols (if None, uses config/DB)
         vendor: Data vendor (if None, uses config default)
         auto_fetch: If True, automatically fetch missing data
+        force_full_refetch: If True, treat all symbols as missing and fetch full history
     
     Returns:
         Dict with status and details
@@ -850,7 +891,8 @@ def ensure_data_coverage(
         target_end=target_end,
         symbols=symbols,
         vendor=vendor,
-        auto_fetch=auto_fetch
+        auto_fetch=auto_fetch,
+        force_full_refetch=force_full_refetch
     )
 
 
