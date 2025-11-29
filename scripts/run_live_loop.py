@@ -163,10 +163,12 @@ def load_or_train_model(
             loaded_multi_horizon = model_data.get('multi_horizon', False)
             if loaded_multi_horizon != multi_horizon:
                 logger.info(f"Model multi-horizon mismatch (loaded: {loaded_multi_horizon}, requested: {multi_horizon}), retraining...")
+                # Skip loading, fall through to training
             elif multi_horizon and horizons:
                 loaded_horizons = model_data.get('horizons', [])
                 if set(loaded_horizons) != set(horizons):
                     logger.info(f"Model horizons mismatch (loaded: {loaded_horizons}, requested: {horizons}), retraining...")
+                    # Skip loading, fall through to training
                 else:
                     # Check if model is recent enough
                     model_date = model_data.get('trained_date')
@@ -254,35 +256,9 @@ def load_or_train_model(
                         logger.info(f"Model is {model_age_days} days old, retraining...")
         except Exception as e:
             logger.warning(f"Could not load model from {model_path}: {e}")
-
-
-def _validate_model_features(model_data: dict, expected_features: list) -> list:
-    """
-    Validate model features against expected features.
     
-    Returns list of issues (empty if valid).
-    """
-    from models.tabular_trainer import FeatureSchema
-    
-    # Try to get feature schema from model data
-    if 'feature_schema' in model_data:
-        schema = FeatureSchema.from_dict(model_data['feature_schema'])
-        is_valid, issues = schema.validate(expected_features, strict=True)
-        return issues if not is_valid else []
-    
-    # Fall back to feature_cols comparison
-    model_features = model_data.get('feature_cols', [])
-    if not model_features:
-        return []  # Can't validate without stored features
-    
-    # Build schema and validate
-    schema = FeatureSchema(
-        feature_names=model_features,
-        feature_hash=FeatureSchema._compute_hash(model_features),
-        horizons=[model_data.get('horizon', 20)],
-    )
-    is_valid, issues = schema.validate(expected_features, strict=True)
-    return issues if not is_valid else []
+    # Train new model using TabularTrainer
+    logger.info(f"Training new {model_type} model...")
     
     # Determine horizons for training
     if multi_horizon and horizons:
@@ -479,6 +455,35 @@ def _validate_model_features(model_data: dict, expected_features: list) -> list:
         
         logger.info(f"Model saved to {model_path}")
         return training_result.model
+
+
+def _validate_model_features(model_data: dict, expected_features: list) -> list:
+    """
+    Validate model features against expected features.
+    
+    Returns list of issues (empty if valid).
+    """
+    from models.tabular_trainer import FeatureSchema
+    
+    # Try to get feature schema from model data
+    if 'feature_schema' in model_data:
+        schema = FeatureSchema.from_dict(model_data['feature_schema'])
+        is_valid, issues = schema.validate(expected_features, strict=True)
+        return issues if not is_valid else []
+    
+    # Fall back to feature_cols comparison
+    model_features = model_data.get('feature_cols', [])
+    if not model_features:
+        return []  # Can't validate without stored features
+    
+    # Build schema and validate
+    schema = FeatureSchema(
+        feature_names=model_features,
+        feature_hash=FeatureSchema._compute_hash(model_features),
+        horizons=[model_data.get('horizon', 20)],
+    )
+    is_valid, issues = schema.validate(expected_features, strict=True)
+    return issues if not is_valid else []
 
 
 def write_heartbeat(heartbeat_path: Path, status: str = "running"):

@@ -366,10 +366,17 @@ class LiveEngine:
         X = X.astype(np.float64)
         
         # Check model type
+        if self.model is None:
+            logger.error("Model is None - cannot make predictions")
+            return {}
+        
         if isinstance(self.model, dict):
             # Dict of models (one per horizon) - multi-horizon tabular
             predictions = {}
             for horizon, model in self.model.items():
+                if model is None:
+                    logger.warning(f"Model for horizon {horizon} is None, skipping")
+                    continue
                 pred, sigma = self._predict_single_model(model, X)
                 predictions[horizon] = (pred, sigma)
             return predictions
@@ -391,6 +398,11 @@ class LiveEngine:
         Returns:
             Tuple of (predictions, uncertainties)
         """
+        # Check if model is None
+        if model is None:
+            logger.error("Model is None - cannot make predictions")
+            raise ValueError("Model is None")
+        
         # Ensure X is properly numeric before any model calls
         # Convert to float64 to avoid object dtype issues
         X_clean = X.copy()
@@ -421,6 +433,10 @@ class LiveEngine:
         # PyTorch model
         try:
             import torch
+            # Check if model is actually a PyTorch model
+            if not isinstance(model, torch.nn.Module):
+                raise ValueError(f"Model is not a PyTorch module: {type(model)}")
+            
             # Ensure X is numeric and convert to numpy array
             X_array = X_clean.values
             # Double-check dtype
@@ -450,8 +466,11 @@ class LiveEngine:
                     return pred, sigma
         except ImportError:
             pass
+        except Exception as e:
+            logger.warning(f"PyTorch model prediction failed: {e}")
+            # Don't raise here, fall through to final error
         
-        raise ValueError(f"Unknown model type: {type(model)}")
+        raise ValueError(f"Unknown model type or model has no valid prediction method: {type(model)}")
     
     def _estimate_uncertainty(self, model, X: pd.DataFrame, predictions: np.ndarray) -> np.ndarray:
         """
