@@ -28,6 +28,9 @@ class RegimeFeatureBuilder:
     - Raw regime indicators (vol, drawdown) for VIX-style sizing
     """
     
+    # Class-level flag to only warn once about missing regimes table
+    _warned_missing_regimes = False
+    
     def __init__(self, api: AsOfQueryAPI, include_raw_features: bool = True):
         self.api = api
         self.include_raw_features = include_raw_features
@@ -97,8 +100,16 @@ class RegimeFeatureBuilder:
             
             return pd.DataFrame(records)
         except Exception as e:
-            # Table may not exist or other error
-            logger.debug(f"RegimeFeatureBuilder error: {e}")
+            # Table may not exist or other error - only warn once
+            if not RegimeFeatureBuilder._warned_missing_regimes:
+                if "does not exist" in str(e):
+                    logger.warning(
+                        "Regimes table not found - regime features will be skipped. "
+                        "Run regime bootstrap or scripts/analyze_regime_performance.py to create it."
+                    )
+                else:
+                    logger.warning(f"RegimeFeatureBuilder error: {e}")
+                RegimeFeatureBuilder._warned_missing_regimes = True
             return pd.DataFrame(columns=['asset_id'])
     
     def _get_raw_regime_features(self, as_of_date: date) -> Dict:

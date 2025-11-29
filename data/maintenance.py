@@ -700,10 +700,10 @@ class DataMaintenanceManager:
             result['status'] = 'error'
             result['message'] = f"Failed to fetch data: {total_errors} errors"
         
-        # Bootstrap universe_membership if this was a fresh database
+        # Bootstrap universe_membership and regimes if this was a fresh database
         if bootstrap_universe and total_bars > 0:
+            # Bootstrap universe membership
             try:
-                # Check if universe_membership is empty
                 um_count = self.storage.query("SELECT COUNT(*) as cnt FROM universe_membership")
                 if um_count['cnt'].iloc[0] == 0:
                     logger.info("Bootstrapping universe_membership from CSV...")
@@ -712,6 +712,18 @@ class DataMaintenanceManager:
                     result['message'] += " (universe bootstrapped)"
             except Exception as e:
                 logger.warning(f"Could not bootstrap universe_membership: {e}")
+            
+            # Bootstrap regimes (check separately - may need to create even if universe exists)
+            try:
+                regimes_count = self.storage.query("SELECT COUNT(*) as cnt FROM regimes")
+                regimes_exist = regimes_count['cnt'].iloc[0] > 0
+            except Exception:
+                regimes_exist = False
+            
+            if not regimes_exist:
+                logger.info("Bootstrapping regimes...")
+                self._bootstrap_regimes()
+                result['message'] += " (regimes bootstrapped)"
         
         logger.info(f"Data maintenance complete: {result['message']}")
         return result
@@ -743,6 +755,38 @@ class DataMaintenanceManager:
             
         except Exception as e:
             logger.warning(f"Failed to bootstrap universe_membership: {e}")
+    
+    def _bootstrap_regimes(self):
+        """
+        Build regimes table by fitting a regime model on historical data.
+        Called automatically when database is bootstrapped from empty.
+        """
+        try:
+            from labels.regimes import RegimeLabelGenerator
+            
+            coverage = self.checker.get_current_coverage()
+            if not coverage['has_data']:
+                logger.warning("Cannot bootstrap regimes: no price data available")
+                return
+            
+            # Use the full date range from the data
+            start_date = coverage['min_date']
+            end_date = coverage['max_date']
+            
+            logger.info(f"Fitting regime model from {start_date} to {end_date}...")
+            
+            regime_gen = RegimeLabelGenerator(self.storage, n_regimes=4)
+            regimes_df = regime_gen.fit_regimes(start_date, end_date, method="kmeans")
+            
+            if len(regimes_df) > 0:
+                regime_gen.save_regimes(regimes_df)
+                regime_gen.save_model("artifacts/models/regime_model.pkl")
+                logger.info(f"Regimes bootstrapped: {len(regimes_df)} dates labeled")
+            else:
+                logger.warning("No regime labels generated")
+                
+        except Exception as e:
+            logger.warning(f"Failed to bootstrap regimes: {e}")
     
     def validate_data_sufficiency(self, min_days: int = 252) -> Dict[str, Any]:
         """
