@@ -72,7 +72,13 @@ class LiveEngine:
         except Exception:
             return {}
     
-    def run_daily_loop(self, trading_date: date, dry_run: bool = False, universe: Optional[Set[int]] = None):
+    def run_daily_loop(
+        self, 
+        trading_date: date, 
+        dry_run: bool = False, 
+        universe: Optional[Set[int]] = None,
+        skip_preflight: bool = False
+    ):
         """
         Run daily trading loop.
         
@@ -82,11 +88,12 @@ class LiveEngine:
             trading_date: The trading date to run for
             dry_run: If True, don't submit orders (for testing)
             universe: Optional pre-computed universe. If None, will fetch from API.
+            skip_preflight: If True, skip pre-flight checks (for --force mode)
         """
         logger.info(f"Running daily loop for {trading_date}")
         
-        # Pre-flight checks
-        if not self._run_preflight_checks(trading_date):
+        # Pre-flight checks (can be skipped in force mode)
+        if not skip_preflight and not self._run_preflight_checks(trading_date):
             logger.error("Pre-flight checks failed, aborting")
             return
         

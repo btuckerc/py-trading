@@ -1081,6 +1081,21 @@ def prepare_for_trading(
                         f"Limited data: {avg_bars:.0f} bars per asset (recommend {lookback_days}+)"
                     )
             
+            # Still ensure regimes exist even in force mode
+            try:
+                regimes_count = manager.storage.query("SELECT COUNT(*) as cnt FROM regimes")
+                regimes_exist = regimes_count['cnt'].iloc[0] > 0
+            except Exception:
+                regimes_exist = False
+            
+            if not regimes_exist:
+                logger.info("FORCE MODE: Regimes table missing - bootstrapping...")
+                try:
+                    manager._bootstrap_regimes()
+                    result['regimes_bootstrapped'] = True
+                except Exception as e:
+                    logger.warning(f"Could not bootstrap regimes: {e}")
+            
             logger.info(f"FORCE MODE: Using available data as-of {data_date}")
             return result
         else:

@@ -316,7 +316,9 @@ def main():
     # Initialize feature pipeline
     feature_pipeline = FeaturePipeline(api, config.features)
     calendar = TradingCalendar()
-    trading_days = calendar.get_trading_days(start_date, end_date)
+    
+    # Get trading days for TRAINING period (not backtest period)
+    training_trading_days = calendar.get_trading_days(train_start, train_end)
     
     # Build training features
     logger.info("Building training features...")
@@ -324,7 +326,8 @@ def main():
     train_features_dict = {h: [] for h in args.horizons}
     train_labels_dict = {h: [] for h in args.horizons}
     
-    train_dates = [d.date() for d in trading_days if train_start <= d.date() <= train_end][::10]
+    # Sample every 10th trading day from the training period
+    train_dates = [d.date() for d in training_trading_days][::10]
     logger.info(f"Sampling {len(train_dates)} training dates")
     
     successful_dates = 0
@@ -440,7 +443,9 @@ def main():
     strategy = LongTopKStrategy(k=args.top_k, min_score_threshold=-np.inf, min_confidence=0.5 if args.use_uncertainty else 0.0)
     
     all_weights = []
-    backtest_dates = [d.date() for d in trading_days if start_date <= d.date() <= end_date]
+    # Get trading days for the backtest period
+    backtest_trading_days = calendar.get_trading_days(start_date, end_date)
+    backtest_dates = [d.date() for d in backtest_trading_days]
     
     for backtest_date in backtest_dates:
         try:

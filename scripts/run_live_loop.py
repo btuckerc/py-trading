@@ -663,7 +663,12 @@ def main():
     
     # Run the daily loop (this handles features, predictions, position-aware rebalancing, orders, and logging)
     try:
-        engine.run_daily_loop(trading_date, dry_run=args.dry_run, universe=universe)
+        engine.run_daily_loop(
+            trading_date, 
+            dry_run=args.dry_run, 
+            universe=universe,
+            skip_preflight=args.force  # Skip idempotency check in force mode
+        )
     except Exception as e:
         logger.error(f"Error in daily loop: {e}")
         if args.enable_alerts and alert_manager:
