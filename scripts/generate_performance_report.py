@@ -982,82 +982,238 @@ def generate_html_report(results: dict, metrics: dict, charts_dir: Path, output_
             --text: #212529;
             --border: #dee2e6;
         }}
+        
+        /* PDF-optimized base styles */
+        @page {{
+            size: letter;
+            margin: 0.5in;
+        }}
+        
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: var(--bg);
             color: var(--text);
-            line-height: 1.6;
-            padding: 2rem;
+            line-height: 1.4;
+            font-size: 11px;
         }}
-        .container {{ max-width: 1200px; margin: 0 auto; }}
-        h1 {{ font-size: 2rem; margin-bottom: 0.5rem; }}
-        h2 {{ font-size: 1.5rem; margin: 2rem 0 1rem; border-bottom: 2px solid var(--primary); padding-bottom: 0.5rem; }}
-        .subtitle {{ color: #6c757d; margin-bottom: 2rem; }}
-        .card {{
+        
+        .container {{ 
+            max-width: 7.5in;
+            margin: 0 auto;
+        }}
+        
+        /* Header section - compact */
+        .header {{
+            text-align: center;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid var(--primary);
+        }}
+        
+        h1 {{ 
+            font-size: 18px; 
+            margin-bottom: 4px;
+            color: var(--text);
+        }}
+        
+        .subtitle {{ 
+            color: #6c757d; 
+            font-size: 10px;
+            margin: 0;
+        }}
+        
+        h2 {{ 
+            font-size: 12px; 
+            margin: 10px 0 6px 0;
+            color: var(--primary);
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 3px;
+        }}
+        
+        /* Assessment banner - slim */
+        .assessment-card {{
             background: var(--card-bg);
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            padding: 1.5rem;
-            margin-bottom: 1.5rem;
+            border-radius: 4px;
+            padding: 6px 12px;
+            margin-bottom: 10px;
+            text-align: center;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.08);
         }}
+        
+        .assessment {{ 
+            font-size: 13px; 
+            font-weight: bold;
+        }}
+        
+        /* Metrics grid - compact 6-column */
+        .metrics-card {{
+            background: var(--card-bg);
+            border-radius: 4px;
+            padding: 10px;
+            margin-bottom: 10px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+        }}
+        
         .metrics-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
+            grid-template-columns: repeat(6, 1fr);
+            gap: 8px;
         }}
+        
         .metric {{
             text-align: center;
-            padding: 1rem;
+            padding: 6px 4px;
             background: var(--bg);
-            border-radius: 8px;
+            border-radius: 4px;
         }}
+        
         .metric-value {{
-            font-size: 2rem;
+            font-size: 16px;
             font-weight: bold;
             color: var(--primary);
+            line-height: 1.2;
         }}
-        .metric-label {{ font-size: 0.9rem; color: #6c757d; }}
+        
+        .metric-label {{ 
+            font-size: 8px; 
+            color: #6c757d;
+            margin-top: 2px;
+        }}
+        
         .positive {{ color: var(--positive) !important; }}
         .negative {{ color: var(--negative) !important; }}
-        table {{ width: 100%; border-collapse: collapse; margin: 1rem 0; }}
-        th, td {{ padding: 0.75rem; text-align: left; border-bottom: 1px solid var(--border); }}
-        th {{ background: var(--bg); font-weight: 600; }}
-        tr:hover {{ background: #f1f3f4; }}
-        .chart-container {{ margin: 1rem 0; text-align: center; }}
-        .chart-container img {{ max-width: 100%; height: auto; border-radius: 8px; }}
-        .assessment {{ font-size: 1.2rem; font-weight: bold; padding: 1rem; text-align: center; }}
-        .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }}
-        @media (max-width: 768px) {{ .two-col {{ grid-template-columns: 1fr; }} }}
-        .footer {{ text-align: center; color: #6c757d; margin-top: 3rem; font-size: 0.9rem; }}
+        
+        /* Charts - constrained sizes */
+        .card {{
+            background: var(--card-bg);
+            border-radius: 4px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+            padding: 8px;
+            margin-bottom: 10px;
+        }}
+        
+        .chart-container {{ 
+            text-align: center;
+        }}
+        
+        .chart-container img {{ 
+            max-width: 100%;
+            height: auto;
+            border-radius: 4px;
+        }}
+        
+        /* Main equity chart - larger */
+        .chart-main img {{
+            max-height: 180px;
+            width: auto;
+        }}
+        
+        /* Secondary charts - smaller */
+        .chart-secondary img {{
+            max-height: 120px;
+            width: auto;
+        }}
+        
+        /* Two column layout */
+        .two-col {{ 
+            display: grid; 
+            grid-template-columns: 1fr 1fr; 
+            gap: 10px;
+        }}
+        
+        .two-col h2 {{
+            margin-top: 0;
+        }}
+        
+        /* Tables - compact */
+        table {{ 
+            width: 100%; 
+            border-collapse: collapse;
+            font-size: 9px;
+        }}
+        
+        th, td {{ 
+            padding: 4px 6px; 
+            text-align: left; 
+            border-bottom: 1px solid var(--border);
+        }}
+        
+        th {{ 
+            background: var(--bg); 
+            font-weight: 600;
+            font-size: 8px;
+            text-transform: uppercase;
+            color: #6c757d;
+        }}
+        
+        /* Three column layout for tables */
+        .three-col {{
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 10px;
+        }}
+        
+        .three-col .card {{
+            margin-bottom: 0;
+        }}
+        
+        /* Footer - minimal */
+        .footer {{ 
+            text-align: center; 
+            color: #6c757d; 
+            margin-top: 12px;
+            padding-top: 8px;
+            border-top: 1px solid var(--border);
+            font-size: 8px;
+        }}
+        
+        .footer p {{
+            margin: 2px 0;
+        }}
+        
+        /* Page break control */
+        .page-break {{
+            page-break-before: always;
+        }}
+        
+        .no-break {{
+            page-break-inside: avoid;
+        }}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>📈 Trading Strategy Performance Report</h1>
-        <p class="subtitle">{summary['start_date']} to {summary['end_date']} | {summary['trading_days']} trading days | {summary['universe_size']} assets</p>
+        <!-- Header -->
+        <div class="header">
+            <h1>Trading Strategy Performance Report</h1>
+            <p class="subtitle">{summary['start_date']} to {summary['end_date']} &bull; {summary['trading_days']} trading days &bull; {summary['universe_size']} assets</p>
+        </div>
         
-        <div class="card">
+        <!-- Assessment -->
+        <div class="assessment-card">
             <div class="assessment" style="{assessment[1]}">{assessment[0]}{alpha_text}</div>
         </div>
         
-        <div class="card">
+        <!-- Key Metrics -->
+        <div class="metrics-card no-break">
             <div class="metrics-grid">
                 <div class="metric">
                     <div class="metric-value {'positive' if summary['total_return_pct'] > 0 else 'negative'}">{summary['total_return_pct']:+.2f}%</div>
-                    <div class="metric-label">ML Strategy Return</div>
+                    <div class="metric-label">ML Strategy</div>
                 </div>
                 <div class="metric">
                     <div class="metric-value {spy_return_class}">{spy_return_str}</div>
-                    <div class="metric-label">S&P 500 Return</div>
+                    <div class="metric-label">S&P 500</div>
                 </div>
                 <div class="metric">
                     <div class="metric-value">{summary['sharpe_ratio']:.2f}</div>
-                    <div class="metric-label">Sharpe Ratio</div>
+                    <div class="metric-label">Sharpe</div>
                 </div>
                 <div class="metric">
                     <div class="metric-value negative">{summary['max_drawdown_pct']:.2f}%</div>
-                    <div class="metric-label">Max Drawdown</div>
+                    <div class="metric-label">Max DD</div>
                 </div>
                 <div class="metric">
                     <div class="metric-value">{summary['win_rate_pct']:.1f}%</div>
@@ -1065,39 +1221,43 @@ def generate_html_report(results: dict, metrics: dict, charts_dir: Path, output_
                 </div>
                 <div class="metric">
                     <div class="metric-value">{summary['annualized_volatility_pct']:.1f}%</div>
-                    <div class="metric-label">Volatility (Ann.)</div>
+                    <div class="metric-label">Volatility</div>
                 </div>
             </div>
         </div>
         
-        <h2>📊 Equity Curve</h2>
-        <div class="card chart-container">
+        <!-- Equity Curve -->
+        <h2>Equity Curve</h2>
+        <div class="card chart-container chart-main no-break">
             <img src="equity_curve.png" alt="Equity Curve">
         </div>
         
-        <div class="two-col">
+        <!-- Secondary Charts Row -->
+        <div class="two-col no-break">
             <div>
-                <h2>📉 Drawdown</h2>
-                <div class="card chart-container">
+                <h2>Drawdown</h2>
+                <div class="card chart-container chart-secondary">
                     <img src="drawdown.png" alt="Drawdown">
                 </div>
             </div>
             <div>
-                <h2>📊 Returns Distribution</h2>
-                <div class="card chart-container">
+                <h2>Returns Distribution</h2>
+                <div class="card chart-container chart-secondary">
                     <img src="returns_distribution.png" alt="Returns Distribution">
                 </div>
             </div>
         </div>
         
-        <h2>📅 Monthly Returns</h2>
-        <div class="card chart-container">
+        <!-- Monthly Returns -->
+        <h2>Monthly Returns</h2>
+        <div class="card chart-container chart-secondary no-break">
             <img src="monthly_returns.png" alt="Monthly Returns">
         </div>
         
-        <div class="two-col">
+        <!-- Tables Row: Best Days, Worst Days, Top Positions -->
+        <div class="three-col no-break">
             <div>
-                <h2>🏆 Best Days</h2>
+                <h2>Best Days</h2>
                 <div class="card">
                     <table>
                         <tr><th>Date</th><th>Return</th></tr>
@@ -1106,7 +1266,7 @@ def generate_html_report(results: dict, metrics: dict, charts_dir: Path, output_
                 </div>
             </div>
             <div>
-                <h2>📉 Worst Days</h2>
+                <h2>Worst Days</h2>
                 <div class="card">
                     <table>
                         <tr><th>Date</th><th>Return</th></tr>
@@ -1114,19 +1274,20 @@ def generate_html_report(results: dict, metrics: dict, charts_dir: Path, output_
                     </table>
                 </div>
             </div>
+            <div>
+                <h2>Top Positions</h2>
+                <div class="card">
+                    <table>
+                        <tr><th>Symbol</th><th>Days</th><th>%</th></tr>
+                        {"".join(f'<tr><td>{s}</td><td>{c}</td><td>{c/(summary["trading_days"]-1)*100:.0f}%</td></tr>' for s, c in metrics['top_positions'][:5])}
+                    </table>
+                </div>
+            </div>
         </div>
         
-        <h2>🎯 Top Positions</h2>
-        <div class="card">
-            <table>
-                <tr><th>Symbol</th><th>Days Held</th><th>% of Period</th></tr>
-                {"".join(f'<tr><td>{s}</td><td>{c}</td><td>{c/(summary["trading_days"]-1)*100:.1f}%</td></tr>' for s, c in metrics['top_positions'][:10])}
-            </table>
-        </div>
-        
+        <!-- Footer -->
         <div class="footer">
-            <p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-            <p>Model trained on data before simulation period (no lookahead bias)</p>
+            <p>Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} &bull; Model trained on data before simulation period (no lookahead bias)</p>
         </div>
     </div>
 </body>
