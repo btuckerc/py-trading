@@ -28,6 +28,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 from datetime import date, datetime
+from typing import Optional, List
 import argparse
 import pandas as pd
 import numpy as np
@@ -48,7 +49,7 @@ from labels.returns import ReturnLabelGenerator
 from labels.regimes import RegimeLabelGenerator
 from features.pipeline import FeaturePipeline
 from features.regime_metrics import RegimeMetricsService
-from models.tabular import XGBoostModel, LightGBMModel
+from models.tabular import XGBoostModel, LightGBMModel, EnsembleXGBoostModel
 from portfolio.strategies import LongTopKStrategy
 from portfolio.scores import ScoreConverter
 from portfolio.risk import RiskManager, ExposureManager, DrawdownManager, SectorTiltManager
@@ -109,6 +110,8 @@ def load_or_train_model(
     training_end_date: date,
     universe: set,
     horizon: int = 20,
+    horizons: Optional[List[int]] = None,
+    multi_horizon: bool = False,
     train_days: int = 750,  # ~3 years
     force_retrain: bool = False,
     expected_features: list = None,  # Changed from expected_feature_count to full list
@@ -156,32 +159,78 @@ def load_or_train_model(
             with open(model_path, 'rb') as f:
                 model_data = pickle.load(f)
             
-            # Check if model is recent enough
-            model_date = model_data.get('trained_date')
-            if model_date:
-                # Use retraining policy cadence if available, else fall back to live config
-                if retraining_config:
-                    should_retrain, reason = retraining_config.should_retrain(
-                        model_date, training_end_date
-                    )
-                    if not should_retrain:
-                        # Validate feature schema if expected_features provided
-                        if expected_features is not None:
-                            schema_issues = _validate_model_features(model_data, expected_features)
-                            if schema_issues:
-                                logger.warning(
-                                    f"Feature schema mismatch: {'; '.join(schema_issues)}. Retraining..."
-                                )
+            # Check if model matches multi-horizon setting
+            loaded_multi_horizon = model_data.get('multi_horizon', False)
+            if loaded_multi_horizon != multi_horizon:
+                logger.info(f"Model multi-horizon mismatch (loaded: {loaded_multi_horizon}, requested: {multi_horizon}), retraining...")
+            elif multi_horizon and horizons:
+                loaded_horizons = model_data.get('horizons', [])
+                if set(loaded_horizons) != set(horizons):
+                    logger.info(f"Model horizons mismatch (loaded: {loaded_horizons}, requested: {horizons}), retraining...")
+                else:
+                    # Check if model is recent enough
+                    model_date = model_data.get('trained_date')
+                    if model_date:
+                        # Use retraining policy cadence if available
+                        if retraining_config:
+                            should_retrain, reason = retraining_config.should_retrain(
+                                model_date, training_end_date
+                            )
+                            if not should_retrain:
+                                # Validate feature schema if expected_features provided
+                                if expected_features is not None:
+                                    schema_issues = _validate_model_features(model_data, expected_features)
+                                    if schema_issues:
+                                        logger.warning(
+                                            f"Feature schema mismatch: {'; '.join(schema_issues)}. Retraining..."
+                                        )
+                                    else:
+                                        model_age_days = (training_end_date - model_date).days
+                                        logger.info(f"Loaded existing multi-horizon model from {model_path} (trained {model_age_days} days ago)")
+                                        return model_data['model']
+                                else:
+                                    model_age_days = (training_end_date - model_date).days
+                                    logger.info(f"Loaded existing multi-horizon model from {model_path} (trained {model_age_days} days ago)")
+                                    return model_data['model']
+                            else:
+                                logger.info(f"Retraining needed: {reason}")
+                        else:
+                            # Legacy behavior
+                            model_age_days = (training_end_date - model_date).days
+                            retrain_frequency = config.live.get('retrain_frequency_days', 30) if hasattr(config, 'live') else 30
+                            if model_age_days <= retrain_frequency:
+                                model_age_days = (training_end_date - model_date).days
+                                logger.info(f"Loaded existing multi-horizon model from {model_path} (trained {model_age_days} days ago)")
+                                return model_data['model']
+                            else:
+                                logger.info(f"Model is {model_age_days} days old, retraining...")
+            else:
+                # Single-horizon: check if model is recent enough
+                model_date = model_data.get('trained_date')
+                if model_date:
+                    # Use retraining policy cadence if available, else fall back to live config
+                    if retraining_config:
+                        should_retrain, reason = retraining_config.should_retrain(
+                            model_date, training_end_date
+                        )
+                        if not should_retrain:
+                            # Validate feature schema if expected_features provided
+                            if expected_features is not None:
+                                schema_issues = _validate_model_features(model_data, expected_features)
+                                if schema_issues:
+                                    logger.warning(
+                                        f"Feature schema mismatch: {'; '.join(schema_issues)}. Retraining..."
+                                    )
+                                else:
+                                    model_age_days = (training_end_date - model_date).days
+                                    logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
+                                    return model_data['model']
                             else:
                                 model_age_days = (training_end_date - model_date).days
                                 logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
                                 return model_data['model']
                         else:
-                            model_age_days = (training_end_date - model_date).days
-                            logger.info(f"Loaded existing model from {model_path} (trained {model_age_days} days ago)")
-                            return model_data['model']
-                    else:
-                        logger.info(f"Retraining needed: {reason}")
+                            logger.info(f"Retraining needed: {reason}")
                 else:
                     # Legacy behavior: use live config retrain_frequency_days
                     model_age_days = (training_end_date - model_date).days
@@ -235,8 +284,13 @@ def _validate_model_features(model_data: dict, expected_features: list) -> list:
     is_valid, issues = schema.validate(expected_features, strict=True)
     return issues if not is_valid else []
     
-    # Train new model using TabularTrainer
-    logger.info(f"Training new {model_type} model...")
+    # Determine horizons for training
+    if multi_horizon and horizons:
+        target_horizons = horizons
+        logger.info(f"Training multi-horizon models for horizons: {target_horizons}")
+    else:
+        target_horizons = [horizon]
+        multi_horizon = False
     
     # Calculate training period using retraining config if available
     if retraining_config:
@@ -255,19 +309,6 @@ def _validate_model_features(model_data: dict, expected_features: list) -> list:
     label_generator = ReturnLabelGenerator(storage)
     feature_pipeline = FeaturePipeline(api, config.features)
     
-    # Build TrainingConfig
-    training_config = TrainingConfig(
-        window_start=training_start_date,
-        window_end=training_end_date,
-        horizons=[horizon],
-        sampling=SamplingStrategy(sample_every_n_days=5),
-        time_decay_enabled=time_decay_enabled,
-        time_decay_lambda=time_decay_lambda,
-        time_decay_min_weight=time_decay_min_weight,
-        feature_lookback_days=252,
-        benchmark_symbol="SPY",
-    )
-    
     # Initialize TabularTrainer
     trainer = TabularTrainer(
         feature_pipeline=feature_pipeline,
@@ -277,7 +318,10 @@ def _validate_model_features(model_data: dict, expected_features: list) -> list:
     )
     
     # Determine model class and params
-    if model_type == "xgboost":
+    if model_type == "ensemble_xgboost":
+        model_class = EnsembleXGBoostModel
+        model_params = {"task_type": "regression", "n_models": 5, "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
+    elif model_type == "xgboost":
         model_class = XGBoostModel
         model_params = {"task_type": "regression", "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
     elif model_type == "lightgbm":
@@ -286,58 +330,155 @@ def _validate_model_features(model_data: dict, expected_features: list) -> list:
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
-    # Train using TabularTrainer
-    training_result = trainer.train(
-        model_class=model_class,
-        model_params=model_params,
-        config=training_config,
-        universe=universe,
-    )
-    
-    logger.info(f"Training complete: {training_result.num_samples} samples, {training_result.feature_count} features")
-    if training_result.sample_weight_range:
-        logger.info(f"Sample weight range: [{training_result.sample_weight_range[0]:.3f}, {training_result.sample_weight_range[1]:.3f}]")
-    
-    # Build feature schema
-    feature_schema = FeatureSchema(
-        feature_names=training_result.feature_names,
-        feature_hash=training_result.feature_hash,
-        horizons=training_result.horizons,
-        created_date=training_end_date,
-    )
-    
-    # Save model with full metadata
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    model_data = {
-        'model': training_result.model,
-        'trained_date': training_end_date,
-        'effective_start': training_end_date,
-        'effective_end': None,  # Will be set by next retrain
-        'model_type': model_type,
-        'horizon': horizon,
-        # Legacy fields for backwards compatibility
-        'feature_cols': training_result.feature_names,
-        'feature_count': training_result.feature_count,
-        'training_samples': training_result.num_samples,
-        'config_hash': get_config_hash(dict(config.features)) if hasattr(config, 'features') else None,
-        # New structured metadata
-        'training_result': training_result.to_dict(),
-        'feature_schema': feature_schema.to_dict(),
-        'retraining_config': {
-            'cadence_days': retraining_config.cadence_days if retraining_config else None,
-            'window_type': retraining_config.window_type if retraining_config else None,
-            'window_years': retraining_config.window_years if retraining_config else None,
-            'time_decay_enabled': time_decay_enabled,
-            'time_decay_lambda': time_decay_lambda,
+    if multi_horizon:
+        # Train one model per horizon
+        models = {}
+        training_results = {}
+        feature_cols = None
+        
+        for h in target_horizons:
+            logger.info(f"Training {model_type} model for horizon {h}d...")
+            
+            # Build TrainingConfig for this horizon
+            training_config = TrainingConfig(
+                window_start=training_start_date,
+                window_end=training_end_date,
+                horizons=[h],
+                sampling=SamplingStrategy(sample_every_n_days=5),
+                time_decay_enabled=time_decay_enabled,
+                time_decay_lambda=time_decay_lambda,
+                time_decay_min_weight=time_decay_min_weight,
+                feature_lookback_days=252,
+                benchmark_symbol="SPY",
+            )
+            
+            # Train using TabularTrainer
+            training_result = trainer.train(
+                model_class=model_class,
+                model_params=model_params,
+                config=training_config,
+                universe=universe,
+            )
+            
+            models[h] = training_result.model
+            training_results[h] = training_result
+            
+            if feature_cols is None:
+                feature_cols = training_result.feature_names
+            
+            logger.info(f"Horizon {h}d: {training_result.num_samples} samples, {training_result.feature_count} features")
+        
+        # Build feature schema (use first horizon's schema)
+        first_result = training_results[target_horizons[0]]
+        feature_schema = FeatureSchema(
+            feature_names=first_result.feature_names,
+            feature_hash=first_result.feature_hash,
+            horizons=target_horizons,
+            created_date=training_end_date,
+        )
+        
+        # Save multi-horizon model with full metadata
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        model_data = {
+            'model': models,  # Dict of models
+            'trained_date': training_end_date,
+            'effective_start': training_end_date,
+            'effective_end': None,
+            'model_type': model_type,
+            'horizon': None,  # Multi-horizon
+            'horizons': target_horizons,
+            'multi_horizon': True,
+            # Legacy fields
+            'feature_cols': feature_cols,
+            'feature_count': len(feature_cols) if feature_cols else None,
+            'training_samples': sum(r.num_samples for r in training_results.values()),
+            'config_hash': get_config_hash(dict(config.features)) if hasattr(config, 'features') else None,
+            # Structured metadata
+            'training_results': {h: r.to_dict() for h, r in training_results.items()},
+            'feature_schema': feature_schema.to_dict(),
+            'retraining_config': {
+                'cadence_days': retraining_config.cadence_days if retraining_config else None,
+                'window_type': retraining_config.window_type if retraining_config else None,
+                'window_years': retraining_config.window_years if retraining_config else None,
+                'time_decay_enabled': time_decay_enabled,
+                'time_decay_lambda': time_decay_lambda,
+            }
         }
-    }
-    
-    with open(model_path, 'wb') as f:
-        pickle.dump(model_data, f)
-    
-    logger.info(f"Model saved to {model_path}")
-    
-    return training_result.model
+        
+        with open(model_path, 'wb') as f:
+            pickle.dump(model_data, f)
+        
+        logger.info(f"Multi-horizon model saved to {model_path} ({len(models)} horizons)")
+        return models
+    else:
+        # Single-horizon training
+        logger.info(f"Training new {model_type} model for horizon {horizon}d...")
+        
+        # Build TrainingConfig
+        training_config = TrainingConfig(
+            window_start=training_start_date,
+            window_end=training_end_date,
+            horizons=[horizon],
+            sampling=SamplingStrategy(sample_every_n_days=5),
+            time_decay_enabled=time_decay_enabled,
+            time_decay_lambda=time_decay_lambda,
+            time_decay_min_weight=time_decay_min_weight,
+            feature_lookback_days=252,
+            benchmark_symbol="SPY",
+        )
+        
+        # Train using TabularTrainer
+        training_result = trainer.train(
+            model_class=model_class,
+            model_params=model_params,
+            config=training_config,
+            universe=universe,
+        )
+        
+        logger.info(f"Training complete: {training_result.num_samples} samples, {training_result.feature_count} features")
+        if training_result.sample_weight_range:
+            logger.info(f"Sample weight range: [{training_result.sample_weight_range[0]:.3f}, {training_result.sample_weight_range[1]:.3f}]")
+        
+        # Build feature schema
+        feature_schema = FeatureSchema(
+            feature_names=training_result.feature_names,
+            feature_hash=training_result.feature_hash,
+            horizons=training_result.horizons,
+            created_date=training_end_date,
+        )
+        
+        # Save model with full metadata
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        model_data = {
+            'model': training_result.model,
+            'trained_date': training_end_date,
+            'effective_start': training_end_date,
+            'effective_end': None,
+            'model_type': model_type,
+            'horizon': horizon,
+            'multi_horizon': False,
+            # Legacy fields
+            'feature_cols': training_result.feature_names,
+            'feature_count': training_result.feature_count,
+            'training_samples': training_result.num_samples,
+            'config_hash': get_config_hash(dict(config.features)) if hasattr(config, 'features') else None,
+            # Structured metadata
+            'training_result': training_result.to_dict(),
+            'feature_schema': feature_schema.to_dict(),
+            'retraining_config': {
+                'cadence_days': retraining_config.cadence_days if retraining_config else None,
+                'window_type': retraining_config.window_type if retraining_config else None,
+                'window_years': retraining_config.window_years if retraining_config else None,
+                'time_decay_enabled': time_decay_enabled,
+                'time_decay_lambda': time_decay_lambda,
+            }
+        }
+        
+        with open(model_path, 'wb') as f:
+            pickle.dump(model_data, f)
+        
+        logger.info(f"Model saved to {model_path}")
+        return training_result.model
 
 
 def write_heartbeat(heartbeat_path: Path, status: str = "running"):
@@ -367,8 +508,10 @@ def main():
     parser = argparse.ArgumentParser(description="Run daily live/paper trading loop")
     parser.add_argument("--trading-date", type=str, help="Trading date (YYYY-MM-DD, default: last trading day)")
     parser.add_argument("--model-path", type=str, help="Path to trained model (default: artifacts/models/live_model.pkl)")
-    parser.add_argument("--model-type", type=str, default="xgboost", choices=["xgboost", "lightgbm"])
-    parser.add_argument("--horizon", type=int, default=20, help="Prediction horizon (days)")
+    parser.add_argument("--model-type", type=str, default="xgboost", choices=["xgboost", "lightgbm", "ensemble_xgboost"])
+    parser.add_argument("--horizon", type=int, default=20, help="Prediction horizon (days) for single-horizon mode")
+    parser.add_argument("--multi-horizon", action="store_true", help="Enable multi-horizon prediction and blending")
+    parser.add_argument("--horizons", type=int, nargs="+", help="Prediction horizons (days) for multi-horizon mode (default: from config)")
     parser.add_argument("--initial-capital", type=float, default=100000.0, help="Initial capital")
     parser.add_argument("--symbols", type=str, nargs="+", help="Symbols to trade (default: universe_membership)")
     parser.add_argument("--dry-run", action="store_true", help="Don't submit orders")
@@ -588,6 +731,18 @@ def main():
             config.retraining.time_decay.lambda_ = args.time_decay_lambda
             logger.info(f"Overriding time-decay lambda to {args.time_decay_lambda}")
     
+    # Determine horizons for multi-horizon mode
+    live_horizons = None
+    live_multi_horizon = args.multi_horizon
+    if live_multi_horizon:
+        if args.horizons:
+            live_horizons = args.horizons
+        else:
+            # Get from config
+            labels_config = config.labels if isinstance(config.labels, dict) else config.labels.__dict__ if hasattr(config, 'labels') else {}
+            live_horizons = labels_config.get('horizons', [1, 5, 20, 120])
+        logger.info(f"Multi-horizon mode: horizons {live_horizons}")
+    
     try:
         model = load_or_train_model(
             model_path=model_path,
@@ -598,6 +753,8 @@ def main():
             training_end_date=(pd.Timestamp(trading_date) - pd.Timedelta(days=1)).date(),
             universe=universe,
             horizon=args.horizon,
+            horizons=live_horizons,
+            multi_horizon=live_multi_horizon,
             force_retrain=args.force_retrain,
             use_retraining_policy=use_retraining_policy
         )
@@ -729,6 +886,8 @@ def main():
                 training_end_date=(pd.Timestamp(trading_date) - pd.Timedelta(days=1)).date(),
                 universe=universe,
                 horizon=args.horizon,
+                horizons=live_horizons,
+                multi_horizon=live_multi_horizon,
                 force_retrain=True,  # Force retrain due to feature mismatch
                 expected_features=current_feature_names,
             )
@@ -773,6 +932,22 @@ def main():
     if heartbeat_path:
         write_heartbeat(heartbeat_path, "running")
     
+    # Prepare config dict for LiveEngine (include multi-horizon config)
+    engine_config = config.__dict__.copy()
+    
+    # Add multi-horizon config if available
+    portfolio_config = config.portfolio if isinstance(config.portfolio, dict) else config.portfolio.__dict__ if hasattr(config, 'portfolio') else {}
+    if 'multi_horizon' in portfolio_config:
+        engine_config['multi_horizon'] = portfolio_config['multi_horizon']
+        logger.info("Multi-horizon config loaded from portfolio section")
+    
+    # Add sequence_length if using sequence models
+    if args.model_type in ['conv_lstm', 'tcn']:
+        models_config = config.models if isinstance(config.models, dict) else config.models.__dict__ if hasattr(config, 'models') else {}
+        sequence_config = models_config.get('sequence', {})
+        engine_config['sequence_length'] = sequence_config.get('sequence_length', 60)
+        logger.info(f"Sequence length: {engine_config['sequence_length']}")
+    
     # Create LiveEngine instance with all components
     engine = LiveEngine(
         api=api,
@@ -780,7 +955,7 @@ def main():
         model=model,
         strategy=strategy,
         broker=broker,
-        config=config.__dict__,
+        config=engine_config,
         asset_id_to_symbol=asset_id_to_symbol,
         exposure_manager=exposure_manager,
         drawdown_manager=drawdown_manager

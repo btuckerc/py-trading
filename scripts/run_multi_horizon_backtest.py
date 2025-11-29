@@ -99,7 +99,10 @@ def predict_tabular_with_uncertainty(
     n_ensemble: int = 5
 ) -> dict:
     """
-    Make predictions with uncertainty estimation via ensemble.
+    Make predictions with uncertainty estimation.
+    
+    Uses explicit uncertainty if model supports it (e.g., EnsembleXGBoostModel),
+    otherwise falls back to heuristic estimates.
     
     Returns:
         Dict mapping horizon -> (mean, std) arrays
@@ -107,16 +110,17 @@ def predict_tabular_with_uncertainty(
     predictions = {}
     
     for horizon, model in models.items():
-        # Get base predictions
-        pred_mean = model.predict(X)
-        
-        # For uncertainty, we can use residual-based estimation or ensemble
-        # Simple approach: use residual std from training (approximate)
-        # Better: train ensemble of models
-        # For now, use a fixed uncertainty estimate based on prediction magnitude
-        pred_std = np.abs(pred_mean) * 0.1 + 0.05  # 10% of magnitude + baseline
-        
-        predictions[horizon] = (pred_mean, pred_std)
+        # Check if model supports explicit uncertainty
+        if hasattr(model, 'predict_with_uncertainty'):
+            # Use explicit uncertainty (e.g., EnsembleXGBoostModel)
+            pred_mean, pred_std = model.predict_with_uncertainty(X)
+            predictions[horizon] = (pred_mean, pred_std)
+        else:
+            # Fallback: use heuristic uncertainty
+            pred_mean = model.predict(X)
+            # Heuristic: scale uncertainty by prediction magnitude
+            pred_std = np.abs(pred_mean) * 0.1 + 0.05  # 10% of magnitude + baseline
+            predictions[horizon] = (pred_mean, pred_std)
     
     return predictions
 
@@ -429,12 +433,207 @@ def main():
         sequence_model = None
     elif args.model_type in ["conv_lstm", "tcn"]:
         logger.info(f"Training {args.model_type} sequence model...")
-        # For sequence models, we need to build sequences
-        # This is more complex - for now, log a message
-        logger.warning("Sequence model training not yet fully implemented in this script")
-        logger.warning("Please use the tabular models (xgboost/lightgbm) for now")
-        models = {}
-        sequence_model = None
+        
+        # Build sequences for training
+        logger.info(f"Building sequences of length {args.sequence_length}...")
+        sequences_list = []
+        labels_dict = {h: [] for h in args.horizons}
+        asset_ids_list = []
+        dates_list = []
+        
+        # Sample training dates (every 10th day)
+        for train_date in train_dates:
+            try:
+                # Build sequence ending at train_date
+                sequence_array = feature_pipeline.build_features_sequence(
+                    as_of_date=train_date,
+                    sequence_length=args.sequence_length,
+                    universe=universe
+                )
+                
+                if sequence_array.size == 0:
+                    continue
+                
+                # Get labels for this date (all horizons)
+                date_labels = labels_df[labels_df['date'] == train_date]
+                if len(date_labels) == 0:
+                    continue
+                
+                # Align sequences with labels
+                # sequence_array shape: (num_assets, sequence_length, num_features)
+                # We need to match asset_ids
+                features_df = feature_pipeline.build_features_cross_sectional(
+                    as_of_date=train_date,
+                    universe=universe,
+                    lookback_days=252
+                )
+                
+                if len(features_df) == 0 or 'asset_id' not in features_df.columns:
+                    continue
+                
+                # Get asset_ids in same order as sequence_array
+                asset_ids = features_df['asset_id'].values
+                
+                # Extract labels for each horizon
+                horizon_labels_dict = {}
+                for horizon in args.horizons:
+                    horizon_labels = date_labels[date_labels['horizon'] == horizon]
+                    if len(horizon_labels) == 0:
+                        continue
+                    
+                    # Create label array aligned with asset_ids
+                    label_map = dict(zip(horizon_labels['asset_id'], horizon_labels['target_excess_log_return']))
+                    label_array = np.array([label_map.get(aid, np.nan) for aid in asset_ids])
+                    
+                    # Only keep samples with valid labels
+                    valid_mask = ~np.isnan(label_array)
+                    if valid_mask.sum() == 0:
+                        continue
+                    
+                    horizon_labels_dict[horizon] = (label_array, valid_mask)
+                
+                if len(horizon_labels_dict) == 0:
+                    continue
+                
+                # Use intersection of valid masks across horizons
+                valid_mask = np.ones(len(asset_ids), dtype=bool)
+                for horizon, (_, mask) in horizon_labels_dict.items():
+                    valid_mask = valid_mask & mask
+                
+                if valid_mask.sum() == 0:
+                    continue
+                
+                # Filter to valid samples
+                valid_sequences = sequence_array[valid_mask]
+                valid_asset_ids = asset_ids[valid_mask]
+                
+                # Store sequences and labels
+                sequences_list.append(valid_sequences)
+                asset_ids_list.append(valid_asset_ids)
+                dates_list.append([train_date] * len(valid_asset_ids))
+                
+                for horizon in args.horizons:
+                    if horizon in horizon_labels_dict:
+                        label_array, _ = horizon_labels_dict[horizon]
+                        labels_dict[horizon].append(label_array[valid_mask])
+                    else:
+                        # Fill with NaN for missing horizons
+                        labels_dict[horizon].append(np.full(valid_mask.sum(), np.nan))
+                
+            except Exception as e:
+                if len(sequences_list) == 0:
+                    logger.warning(f"Error building sequence for {train_date}: {e}")
+                continue
+        
+        if len(sequences_list) == 0:
+            logger.error("No sequences built for training")
+            models = {}
+            sequence_model = None
+        else:
+            # Combine all sequences
+            all_sequences = np.concatenate(sequences_list, axis=0)
+            all_asset_ids = np.concatenate(asset_ids_list)
+            all_dates = np.concatenate(dates_list)
+            
+            # Combine labels - use intersection of valid samples across all horizons
+            # Find samples that have valid labels for ALL horizons
+            valid_mask = np.ones(len(all_sequences), dtype=bool)
+            for horizon in args.horizons:
+                horizon_labels = np.concatenate(labels_dict[horizon])
+                horizon_valid = ~np.isnan(horizon_labels)
+                valid_mask = valid_mask & horizon_valid
+            
+            if valid_mask.sum() == 0:
+                logger.error("No samples with valid labels for all horizons")
+                models = {}
+                sequence_model = None
+            else:
+                # Filter sequences and labels to valid samples
+                all_sequences = all_sequences[valid_mask]
+                all_asset_ids = all_asset_ids[valid_mask]
+                all_dates = all_dates[valid_mask]
+                
+                combined_labels = {}
+                for horizon in args.horizons:
+                    horizon_labels = np.concatenate(labels_dict[horizon])
+                    combined_labels[horizon] = horizon_labels[valid_mask]
+                
+                logger.info(f"Valid samples after filtering: {len(all_sequences)}")
+                
+                # Determine input dimension from sequence shape
+                # Determine input dimension from sequence shape
+                _, seq_len, input_dim = all_sequences.shape
+                logger.info(f"Training sequences: {len(all_sequences)} samples, shape {all_sequences.shape}")
+                
+                # Create dataset
+                dataset = SequenceDataset(
+                    sequences=all_sequences,
+                    labels=combined_labels,
+                    asset_ids=all_asset_ids,
+                    dates=all_dates
+                )
+                
+                # Create train/val split (80/20)
+                train_size = int(0.8 * len(dataset))
+                val_size = len(dataset) - train_size
+                train_dataset, val_dataset = torch.utils.data.random_split(
+                    dataset, [train_size, val_size],
+                    generator=torch.Generator().manual_seed(42)
+                )
+                
+                train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+                val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+                
+                # Create model
+                if args.model_type == "conv_lstm":
+                    model = ConvLSTMModel(
+                        input_dim=input_dim,
+                        sequence_length=seq_len,
+                        horizons=list(combined_labels.keys()),
+                        use_uncertainty=args.use_uncertainty
+                    )
+                else:  # tcn
+                    model = TCNModel(
+                        input_dim=input_dim,
+                        sequence_length=seq_len,
+                        horizons=list(combined_labels.keys()),
+                        use_uncertainty=args.use_uncertainty
+                    )
+                
+                # Create loss function
+                loss_fn = MultiHorizonLoss(
+                    horizons=list(combined_labels.keys()),
+                    loss_type="gaussian_nll" if args.use_uncertainty else "mse"
+                )
+                
+                # Create optimizer
+                optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+                
+                # Create trainer
+                trainer = SequenceTrainer(
+                    model=model,
+                    loss_fn=loss_fn,
+                    optimizer=optimizer,
+                    device="cuda" if torch.cuda.is_available() else "cpu"
+                )
+                
+                # Train
+                logger.info("Training sequence model...")
+                trainer.train(
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    epochs=50,
+                    early_stopping_patience=10,
+                    save_best=True
+                )
+                
+                # Load best model
+                trainer.load_checkpoint("best_model.pt")
+                model.eval()
+                
+                logger.info("Sequence model training complete")
+                models = {}  # Not used for sequence models
+                sequence_model = model
     else:
         raise ValueError(f"Unknown model_type: {args.model_type}")
     
@@ -486,8 +685,63 @@ def main():
             # Predict for all horizons
             if args.model_type in ["xgboost", "lightgbm"]:
                 predictions = predict_tabular_with_uncertainty(models, X)
+            elif args.model_type in ["conv_lstm", "tcn"] and sequence_model is not None:
+                # Sequence model predictions
+                # Build sequence ending at backtest_date
+                sequence_array = feature_pipeline.build_features_sequence(
+                    as_of_date=backtest_date,
+                    sequence_length=args.sequence_length,
+                    universe=universe
+                )
+                
+                if sequence_array.size == 0:
+                    predictions = {}
+                else:
+                    # Convert to tensor
+                    sequence_tensor = torch.FloatTensor(sequence_array)
+                    device = next(sequence_model.parameters()).device
+                    sequence_tensor = sequence_tensor.to(device)
+                    
+                    # Predict with uncertainty if enabled
+                    if args.use_uncertainty:
+                        predictions = sequence_model.predict_mc(sequence_tensor, n_samples=50)
+                    else:
+                        # Single forward pass
+                        sequence_model.eval()
+                        with torch.no_grad():
+                            outputs = sequence_model(sequence_tensor)
+                            predictions = {}
+                            for horizon, pred in outputs.items():
+                                if isinstance(pred, tuple):
+                                    # Mean-variance output
+                                    mean = pred[0].cpu().numpy()
+                                    logvar = pred[1].cpu().numpy()
+                                    std = np.sqrt(np.exp(logvar))
+                                    predictions[horizon] = (mean, std)
+                                else:
+                                    # Single output - use heuristic uncertainty
+                                    mean = pred.cpu().numpy()
+                                    std = np.abs(mean) * 0.1 + 0.05
+                                    predictions[horizon] = (mean, std)
+                    
+                    # Map predictions back to asset_ids
+                    # sequence_array shape: (num_assets, seq_len, features)
+                    # features_df has asset_ids in same order
+                    if len(features_df) > 0 and 'asset_id' in features_df.columns:
+                        asset_ids = features_df['asset_id'].values
+                        # Align predictions with asset_ids
+                        aligned_predictions = {}
+                        for horizon in predictions:
+                            mu, sigma = predictions[horizon]
+                            if len(mu) == len(asset_ids):
+                                aligned_predictions[horizon] = (mu, sigma)
+                            else:
+                                # Mismatch - use first N or pad
+                                n = min(len(mu), len(asset_ids))
+                                aligned_predictions[horizon] = (mu[:n], sigma[:n])
+                        predictions = aligned_predictions
             else:
-                # Sequence model predictions (placeholder)
+                # Sequence model not trained
                 predictions = {}
             
             # Convert to scores using ScoreConverter

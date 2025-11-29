@@ -14,6 +14,7 @@ This script runs a complete ML trading pipeline:
 import sys
 from pathlib import Path
 from datetime import date, datetime
+from typing import Optional, List
 import argparse
 import pandas as pd
 import numpy as np
@@ -28,8 +29,9 @@ from data.universe import TradingCalendar
 from data.maintenance import ensure_data_coverage
 from labels.returns import ReturnLabelGenerator
 from features.pipeline import FeaturePipeline
-from models.tabular import XGBoostModel, LightGBMModel
+from models.tabular import XGBoostModel, LightGBMModel, EnsembleXGBoostModel
 from portfolio.strategies import LongTopKStrategy
+from portfolio.scores import ScoreConverter, MultiHorizonConfig
 from backtest.vectorized import VectorizedBacktester
 from backtest.metrics import PerformanceMetrics
 from backtest.benchmarks import BenchmarkStrategies
@@ -351,6 +353,9 @@ def run_policy_driven_backtest(
     end_date: date,
     model_type: str = "xgboost",
     horizon: int = 20,
+    horizons: Optional[List[int]] = None,
+    multi_horizon: bool = False,
+    multi_horizon_config = None,
     top_k: int = 3,
     initial_capital: float = 100000.0,
     config = None
@@ -384,26 +389,61 @@ def run_policy_driven_backtest(
     feature_pipeline = FeaturePipeline(api, config.features if config else None)
     label_generator = ReturnLabelGenerator(storage)
     
+    # Determine horizons to use
+    if multi_horizon and horizons:
+        target_horizons = horizons
+        logger.info(f"Multi-horizon policy-driven backtest: {target_horizons}")
+    else:
+        target_horizons = [horizon]
+        multi_horizon = False
+    
+    # Initialize ScoreConverter if multi-horizon
+    score_converter = None
+    if multi_horizon and multi_horizon_config:
+        score_converter = ScoreConverter(config=multi_horizon_config)
+        logger.info("Using ScoreConverter for multi-horizon combination")
+    
     # Model class and params
-    if model_type == "xgboost":
+    if model_type == "ensemble_xgboost":
+        model_class = EnsembleXGBoostModel
+        model_params = {"task_type": "regression", "n_models": 5, "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
+    elif model_type == "xgboost":
         model_class = XGBoostModel
         model_params = {"task_type": "regression", "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
     else:
         model_class = LightGBMModel
         model_params = {"task_type": "regression", "n_estimators": 100, "max_depth": 5, "learning_rate": 0.1}
     
-    # Initialize walk-forward retrainer
-    retrainer = WalkForwardRetrainer(
-        retraining_config=retraining_config,
-        model_class=model_class,
-        model_params=model_params,
-        feature_pipeline=feature_pipeline,
-        label_generator=label_generator,
-        storage=storage,
-        api=api,
-        universe=universe,
-        horizon=horizon
-    )
+    # Initialize walk-forward retrainer(s)
+    if multi_horizon:
+        # One retrainer per horizon
+        retrainers = {}
+        for h in target_horizons:
+            retrainers[h] = WalkForwardRetrainer(
+                retraining_config=retraining_config,
+                model_class=model_class,
+                model_params=model_params,
+                feature_pipeline=feature_pipeline,
+                label_generator=label_generator,
+                storage=storage,
+                api=api,
+                universe=universe,
+                horizon=h
+            )
+    else:
+        # Single retrainer
+        retrainer = WalkForwardRetrainer(
+            retraining_config=retraining_config,
+            model_class=model_class,
+            model_params=model_params,
+            feature_pipeline=feature_pipeline,
+            label_generator=label_generator,
+            storage=storage,
+            api=api,
+            universe=universe,
+            horizon=horizon
+        )
+        retrainers = {horizon: retrainer}
     
     # Get trading days
     trading_days = [d.date() for d in calendar.get_trading_days(start_date, end_date)]
@@ -417,14 +457,21 @@ def run_policy_driven_backtest(
     
     for i, trading_date in enumerate(trading_days):
         try:
-            # Get model for this date (may trigger retraining)
-            model, was_retrained = retrainer.get_model_for_date(trading_date)
+            # Get model(s) for this date (may trigger retraining)
+            models = {}
+            any_retrained = False
             
-            if was_retrained:
+            for h, retrainer in retrainers.items():
+                model, was_retrained = retrainer.get_model_for_date(trading_date)
+                models[h] = model
+                if was_retrained:
+                    any_retrained = True
+            
+            if any_retrained:
                 retraining_history.append({
                     'date': str(trading_date),
                     'day_index': i,
-                    'model_version': retrainer.model_version
+                    'model_version': retrainers[target_horizons[0]].model_version
                 })
             
             # Build features
@@ -437,21 +484,82 @@ def run_policy_driven_backtest(
             if len(features_df) == 0:
                 continue
             
-            # Predict
+            # Extract feature columns
             feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date']]
             X = features_df[feature_cols].copy()
             for col in X.columns:
                 X[col] = pd.to_numeric(X[col], errors='coerce')
             X = X.fillna(0)
             
-            predictions = model.predict(X)
-            
-            # Compute weights
-            scores_df = pd.DataFrame({
-                'asset_id': features_df['asset_id'].values,
-                'score': predictions,
-                'confidence': np.ones(len(predictions))
-            })
+            # Predict
+            if multi_horizon:
+                # Multi-horizon: get predictions for each horizon
+                predictions_dict = {}
+                for h in target_horizons:
+                    if h not in models:
+                        continue
+                    horizon_model = models[h]
+                    
+                    # Check if model supports uncertainty
+                    if hasattr(horizon_model, 'predict_with_uncertainty'):
+                        mu, sigma = horizon_model.predict_with_uncertainty(X)
+                        predictions_dict[h] = {'mu': mu, 'sigma': sigma}
+                    else:
+                        mu = horizon_model.predict(X)
+                        sigma = np.abs(mu) * 0.1 + 0.05
+                        predictions_dict[h] = {'mu': mu, 'sigma': sigma}
+                
+                # Combine multi-horizon predictions into scores
+                scores = []
+                confidences = []
+                
+                for idx, asset_id in enumerate(features_df['asset_id'].values):
+                    pred_dict = {}
+                    for h in target_horizons:
+                        if h in predictions_dict:
+                            pred_dict[h] = {
+                                'mu': predictions_dict[h]['mu'][idx],
+                                'sigma': predictions_dict[h]['sigma'][idx]
+                            }
+                    
+                    if len(pred_dict) > 0 and score_converter:
+                        score = score_converter.combine_scores(pred_dict)
+                        avg_uncertainty = np.mean([p['sigma'] for p in pred_dict.values()])
+                        confidence = 1.0 / (1.0 + avg_uncertainty) if avg_uncertainty > 0 else 1.0
+                    elif len(pred_dict) > 0:
+                        weights = multi_horizon_config.weights if multi_horizon_config else {h: 1.0/len(pred_dict) for h in pred_dict.keys()}
+                        score = sum(pred_dict[h]['mu'] * weights.get(h, 0.0) for h in pred_dict.keys())
+                        avg_uncertainty = np.mean([p['sigma'] for p in pred_dict.values()])
+                        confidence = 1.0 / (1.0 + avg_uncertainty) if avg_uncertainty > 0 else 1.0
+                    else:
+                        score = 0.0
+                        confidence = 0.0
+                    
+                    scores.append(score)
+                    confidences.append(confidence)
+                
+                scores_df = pd.DataFrame({
+                    'asset_id': features_df['asset_id'].values,
+                    'score': scores,
+                    'confidence': confidences
+                })
+            else:
+                # Single-horizon
+                model = models[horizon]
+                if hasattr(model, 'predict_with_uncertainty'):
+                    mu, sigma = model.predict_with_uncertainty(X)
+                    scores_df = pd.DataFrame({
+                        'asset_id': features_df['asset_id'].values,
+                        'score': mu,
+                        'confidence': 1.0 / (1.0 + sigma)
+                    })
+                else:
+                    predictions = model.predict(X)
+                    scores_df = pd.DataFrame({
+                        'asset_id': features_df['asset_id'].values,
+                        'score': predictions,
+                        'confidence': np.ones(len(predictions))
+                    })
             
             weights_df = strategy.compute_weights(scores_df, as_of_date=trading_date)
             if len(weights_df) > 0:
@@ -1083,8 +1191,9 @@ def main():
     parser.add_argument("--symbols", type=str, nargs="+", help="Symbols to backtest (default: all in database)")
     parser.add_argument("--train-start", type=str, help="Training start date (default: same as start-date)")
     parser.add_argument("--train-end", type=str, help="Training end date (default: 80%% of backtest period)")
-    parser.add_argument("--model", type=str, default="xgboost", choices=["xgboost", "lightgbm"], help="Model type")
-    parser.add_argument("--horizon", type=int, default=20, help="Primary prediction horizon (days)")
+    parser.add_argument("--model", type=str, default="xgboost", choices=["xgboost", "lightgbm", "ensemble_xgboost"], help="Model type")
+    parser.add_argument("--horizon", type=int, default=20, help="Primary prediction horizon (days) - ignored if --multi-horizon is used")
+    parser.add_argument("--multi-horizon", action="store_true", help="Enable multi-horizon mode using config-driven horizons and ScoreConverter")
     parser.add_argument("--top-k", type=int, default=3, help="Number of top assets to hold")
     parser.add_argument("--initial-capital", type=float, default=100000.0, help="Initial capital")
     parser.add_argument("--run-benchmarks", action="store_true", help="Run benchmark strategies for comparison")
@@ -1112,18 +1221,18 @@ def main():
     start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date()
     end_date = datetime.strptime(args.end_date, "%Y-%m-%d").date()
     
-    # Training period (use 80% of backtest period if not specified)
+    # Training period (default: train on data BEFORE backtest period to avoid lookahead)
     if args.train_start:
         train_start = datetime.strptime(args.train_start, "%Y-%m-%d").date()
     else:
-        train_start = start_date
+        # Default: train on 3 years of data BEFORE the backtest period
+        train_start = (pd.Timestamp(start_date) - pd.DateOffset(years=3)).date()
     
     if args.train_end:
         train_end = datetime.strptime(args.train_end, "%Y-%m-%d").date()
     else:
-        # Use 80% of period for training
-        total_days = (end_date - start_date).days
-        train_end = start_date + pd.Timedelta(days=int(total_days * 0.8))
+        # Default: train up to (but not including) the backtest start date
+        train_end = (pd.Timestamp(start_date) - pd.Timedelta(days=1)).date()
     
     logger.info(f"Backtest period: {start_date} to {end_date}")
     logger.info(f"Training period: {train_start} to {train_end}")
@@ -1186,8 +1295,28 @@ def main():
     
     logger.info(f"Universe size: {len(universe)} assets")
     
+    # Determine horizons to use
+    if args.multi_horizon:
+        # Use config-driven horizons
+        labels_config = config.labels if isinstance(config.labels, dict) else config.labels.__dict__ if hasattr(config, 'labels') else {}
+        horizons = labels_config.get('horizons', [1, 5, 20, 120])
+        logger.info(f"Multi-horizon mode: using horizons {horizons} from config")
+        
+        # Load multi-horizon config from portfolio section
+        multi_horizon_config = None
+        portfolio_config = config.portfolio if isinstance(config.portfolio, dict) else config.portfolio.__dict__ if hasattr(config, 'portfolio') else {}
+        if 'multi_horizon' in portfolio_config:
+            mh_dict = portfolio_config['multi_horizon']
+            multi_horizon_config = MultiHorizonConfig.from_config(mh_dict)
+            logger.info(f"Multi-horizon config: method={multi_horizon_config.method}, risk_adjustment={multi_horizon_config.risk_adjustment}")
+    else:
+        # Single-horizon mode
+        horizons = [args.horizon]
+        multi_horizon_config = None
+        logger.info(f"Single-horizon mode: using horizon {args.horizon}")
+    
     # Get all bars for the period (need extended period for labels)
-    max_horizon = args.horizon
+    max_horizon = max(horizons)
     extended_end = pd.Timestamp(end_date) + pd.Timedelta(days=max_horizon * 2)
     all_bars = api.get_bars_asof(extended_end.date(), universe=universe)
     
@@ -1206,12 +1335,12 @@ def main():
     ].copy()
     
     # Generate labels
-    logger.info("Generating return labels...")
+    logger.info(f"Generating return labels for horizons {horizons}...")
     label_generator = ReturnLabelGenerator(storage)
     labels_df = label_generator.generate_labels(
         start_date=train_start,
         end_date=end_date,
-        horizons=[args.horizon],
+        horizons=horizons,
         benchmark_symbol="SPY",
         universe=list(universe)
     )
@@ -1234,15 +1363,22 @@ def main():
     all_trading_days = calendar.get_trading_days(full_range_start, full_range_end)
     trading_days = calendar.get_trading_days(start_date, end_date)
     
-    # Build features and train model
+    # Build features and train model(s)
     logger.info("Building features for training...")
-    train_features_list = []
-    train_labels_list = []
     
     # Sample training dates from the training period (every 10 days to speed up)
     train_trading_days = [d.date() for d in all_trading_days if train_start <= d.date() <= train_end]
     train_dates = train_trading_days[::10]
     logger.info(f"Sampling {len(train_dates)} training dates from {len(train_trading_days)} total trading days in training period")
+    
+    # Prepare training data structures
+    if args.multi_horizon:
+        # Multi-horizon: train one model per horizon
+        train_data_dict = {h: {'features': [], 'labels': []} for h in horizons}
+    else:
+        # Single-horizon: single model
+        train_features_list = []
+        train_labels_list = []
     
     successful_dates = 0
     for train_date in train_dates:
@@ -1256,15 +1392,6 @@ def main():
             if len(features_df) == 0:
                 continue
             
-            # Get labels for this date
-            date_labels = labels_df[
-                (labels_df['date'] == train_date) & 
-                (labels_df['horizon'] == args.horizon)
-            ]
-            
-            if len(date_labels) == 0:
-                continue
-            
             # Ensure date and asset_id columns exist
             if 'date' not in features_df.columns:
                 features_df['date'] = train_date
@@ -1272,27 +1399,69 @@ def main():
                 logger.warning(f"Features for {train_date} missing asset_id, skipping")
                 continue
             
-            # Merge features with labels
-            merged = features_df.merge(
-                date_labels[['asset_id', 'target_excess_log_return']],
-                on='asset_id',
-                how='inner'
-            )
-            
-            if len(merged) == 0:
-                continue
-            
-            # Extract feature columns
-            feature_cols = [c for c in merged.columns if c not in ['asset_id', 'date', 'target_excess_log_return']]
-            X = merged[feature_cols].copy()
+            # Extract feature columns (same for all horizons)
+            feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date']]
+            X = features_df[feature_cols].copy()
             # Convert to numeric and fill NaN
             for col in X.columns:
                 X[col] = pd.to_numeric(X[col], errors='coerce')
             X = X.fillna(0)
-            y = merged['target_excess_log_return'].values
             
-            train_features_list.append(X)
-            train_labels_list.append(y)
+            if args.multi_horizon:
+                # Get labels for each horizon
+                for horizon in horizons:
+                    date_labels = labels_df[
+                        (labels_df['date'] == train_date) & 
+                        (labels_df['horizon'] == horizon)
+                    ]
+                    
+                    if len(date_labels) == 0:
+                        continue
+                    
+                    # Merge features with labels
+                    merged = features_df.merge(
+                        date_labels[['asset_id', 'target_excess_log_return']],
+                        on='asset_id',
+                        how='inner'
+                    )
+                    
+                    if len(merged) == 0:
+                        continue
+                    
+                    y = merged['target_excess_log_return'].values
+                    # Ensure X matches y length (use same order as merged)
+                    X_aligned = X.loc[features_df['asset_id'].isin(merged['asset_id'])]
+                    X_aligned = X_aligned.reindex(merged['asset_id'])
+                    
+                    train_data_dict[horizon]['features'].append(X_aligned)
+                    train_data_dict[horizon]['labels'].append(y)
+            else:
+                # Single-horizon: get labels for primary horizon
+                date_labels = labels_df[
+                    (labels_df['date'] == train_date) & 
+                    (labels_df['horizon'] == args.horizon)
+                ]
+                
+                if len(date_labels) == 0:
+                    continue
+                
+                # Merge features with labels
+                merged = features_df.merge(
+                    date_labels[['asset_id', 'target_excess_log_return']],
+                    on='asset_id',
+                    how='inner'
+                )
+                
+                if len(merged) == 0:
+                    continue
+                
+                y = merged['target_excess_log_return'].values
+                X_aligned = X.loc[features_df['asset_id'].isin(merged['asset_id'])]
+                X_aligned = X_aligned.reindex(merged['asset_id'])
+                
+                train_features_list.append(X_aligned)
+                train_labels_list.append(y)
+            
             successful_dates += 1
             
         except Exception as e:
@@ -1304,28 +1473,76 @@ def main():
     
     logger.info(f"Successfully built features for {successful_dates} out of {len(train_dates)} training dates")
     
-    if len(train_features_list) == 0:
-        logger.error("No training features generated")
-        return
-    
-    # Combine training data
-    X_train = pd.concat(train_features_list, ignore_index=True)
-    y_train = np.concatenate(train_labels_list)
-    
-    logger.info(f"Training data: {len(X_train)} samples, {len(X_train.columns)} features")
-    
-    # Train model
-    logger.info(f"Training {args.model} model...")
-    if args.model == "xgboost":
-        model = XGBoostModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
+    # Train model(s)
+    if args.multi_horizon:
+        # Train one model per horizon
+        models = {}
+        feature_cols = None  # Will be set from first horizon
+        
+        for horizon in horizons:
+            if len(train_data_dict[horizon]['features']) == 0:
+                logger.warning(f"No training data for horizon {horizon}d, skipping")
+                continue
+            
+            # Combine training data for this horizon
+            X_train = pd.concat(train_data_dict[horizon]['features'], ignore_index=True)
+            y_train = np.concatenate(train_data_dict[horizon]['labels'])
+            
+            if feature_cols is None:
+                feature_cols = X_train.columns.tolist()
+            
+            logger.info(f"Training {args.model} model for horizon {horizon}d: {len(X_train)} samples, {len(X_train.columns)} features")
+            
+            # Create model
+            if args.model == "ensemble_xgboost":
+                model = EnsembleXGBoostModel(task_type="regression", n_models=5, n_estimators=100, max_depth=5, learning_rate=0.1)
+            elif args.model == "xgboost":
+                model = XGBoostModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
+            else:
+                model = LightGBMModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
+            
+            model.fit(X_train, y_train)
+            models[horizon] = model
+        
+        if len(models) == 0:
+            logger.error("No models trained")
+            return
+        
+        logger.info(f"Trained {len(models)} models for horizons {list(models.keys())}")
+        model = models  # Store as dict for multi-horizon
     else:
-        model = LightGBMModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
+        # Single-horizon: train one model
+        if len(train_features_list) == 0:
+            logger.error("No training features generated")
+            return
+        
+        # Combine training data
+        X_train = pd.concat(train_features_list, ignore_index=True)
+        y_train = np.concatenate(train_labels_list)
+        feature_cols = X_train.columns.tolist()
+        
+        logger.info(f"Training data: {len(X_train)} samples, {len(X_train.columns)} features")
+        
+        logger.info(f"Training {args.model} model...")
+        if args.model == "ensemble_xgboost":
+            model = EnsembleXGBoostModel(task_type="regression", n_models=5, n_estimators=100, max_depth=5, learning_rate=0.1)
+        elif args.model == "xgboost":
+            model = XGBoostModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
+        else:
+            model = LightGBMModel(task_type="regression", n_estimators=100, max_depth=5, learning_rate=0.1)
+        
+        model.fit(X_train, y_train)
     
-    model.fit(X_train, y_train)
     logger.info("Model training complete")
     
     # Run backtest
     logger.info("Running backtest...")
+    
+    # Initialize ScoreConverter if multi-horizon
+    score_converter = None
+    if args.multi_horizon and multi_horizon_config:
+        score_converter = ScoreConverter(config=multi_horizon_config)
+        logger.info("Using ScoreConverter for multi-horizon combination")
     
     # Initialize strategy
     strategy = LongTopKStrategy(k=args.top_k, min_score_threshold=-np.inf)
@@ -1352,23 +1569,100 @@ def main():
             if 'date' not in features_df.columns:
                 features_df['date'] = backtest_date
             
-            # Extract feature columns
-            feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date']]
-            X = features_df[feature_cols].copy()
+            # Extract feature columns (use same as training)
+            available_cols = [c for c in feature_cols if c in features_df.columns]
+            if len(available_cols) != len(feature_cols):
+                missing = set(feature_cols) - set(available_cols)
+                logger.debug(f"Missing {len(missing)} features for {backtest_date}: {list(missing)[:5]}...")
+            
+            X = features_df[available_cols].copy()
+            # Add missing columns as zeros
+            for col in feature_cols:
+                if col not in X.columns:
+                    X[col] = 0.0
+            
+            # Reorder to match training column order
+            X = X[feature_cols]
+            
             # Convert to numeric and fill NaN
             for col in X.columns:
                 X[col] = pd.to_numeric(X[col], errors='coerce')
             X = X.fillna(0)
             
             # Predict
-            predictions = model.predict(X)
-            
-            # Create scores DataFrame
-            scores_df = pd.DataFrame({
-                'asset_id': features_df['asset_id'].values,
-                'score': predictions,
-                'confidence': np.ones(len(predictions))  # Placeholder
-            })
+            if args.multi_horizon:
+                # Multi-horizon: get predictions for each horizon
+                predictions_dict = {}
+                for horizon in horizons:
+                    if horizon not in model:
+                        continue
+                    
+                    horizon_model = model[horizon]
+                    
+                    # Check if model supports uncertainty
+                    if hasattr(horizon_model, 'predict_with_uncertainty'):
+                        mu, sigma = horizon_model.predict_with_uncertainty(X)
+                        predictions_dict[horizon] = {'mu': mu, 'sigma': sigma}
+                    else:
+                        # Fallback: use mean prediction with heuristic uncertainty
+                        mu = horizon_model.predict(X)
+                        sigma = np.abs(mu) * 0.1 + 0.05  # Heuristic uncertainty
+                        predictions_dict[horizon] = {'mu': mu, 'sigma': sigma}
+                
+                # Combine multi-horizon predictions into scores
+                scores = []
+                confidences = []
+                
+                for idx, asset_id in enumerate(features_df['asset_id'].values):
+                    # Build prediction dict for this asset
+                    pred_dict = {}
+                    for horizon in horizons:
+                        if horizon in predictions_dict:
+                            pred_dict[horizon] = {
+                                'mu': predictions_dict[horizon]['mu'][idx],
+                                'sigma': predictions_dict[horizon]['sigma'][idx]
+                            }
+                    
+                    if len(pred_dict) > 0 and score_converter:
+                        # Use ScoreConverter to combine
+                        score = score_converter.combine_scores(pred_dict)
+                        # Compute confidence from average uncertainty
+                        avg_uncertainty = np.mean([p['sigma'] for p in pred_dict.values()])
+                        confidence = 1.0 / (1.0 + avg_uncertainty) if avg_uncertainty > 0 else 1.0
+                    elif len(pred_dict) > 0:
+                        # Fallback: simple weighted average
+                        weights = multi_horizon_config.weights if multi_horizon_config else {h: 1.0/len(pred_dict) for h in pred_dict.keys()}
+                        score = sum(pred_dict[h]['mu'] * weights.get(h, 0.0) for h in pred_dict.keys())
+                        avg_uncertainty = np.mean([p['sigma'] for p in pred_dict.values()])
+                        confidence = 1.0 / (1.0 + avg_uncertainty) if avg_uncertainty > 0 else 1.0
+                    else:
+                        score = 0.0
+                        confidence = 0.0
+                    
+                    scores.append(score)
+                    confidences.append(confidence)
+                
+                scores_df = pd.DataFrame({
+                    'asset_id': features_df['asset_id'].values,
+                    'score': scores,
+                    'confidence': confidences
+                })
+            else:
+                # Single-horizon: simple prediction
+                if hasattr(model, 'predict_with_uncertainty'):
+                    mu, sigma = model.predict_with_uncertainty(X)
+                    scores_df = pd.DataFrame({
+                        'asset_id': features_df['asset_id'].values,
+                        'score': mu,
+                        'confidence': 1.0 / (1.0 + sigma)  # Convert uncertainty to confidence
+                    })
+                else:
+                    predictions = model.predict(X)
+                    scores_df = pd.DataFrame({
+                        'asset_id': features_df['asset_id'].values,
+                        'score': predictions,
+                        'confidence': np.ones(len(predictions))  # Placeholder
+                    })
             
             # Compute weights
             weights_df = strategy.compute_weights(scores_df, as_of_date=backtest_date)
@@ -1413,9 +1707,15 @@ def main():
     metrics = PerformanceMetrics.compute_metrics(equity_curve)
     
     # Store all results for comparison
+    if args.multi_horizon:
+        horizon_str = "_".join([str(h) for h in horizons])
+        strategy_name = f"{args.model}_multi_horizon_{horizon_str}d_top{args.top_k}"
+    else:
+        strategy_name = f"{args.model}_{args.horizon}d_top{args.top_k}"
+    
     all_results = {
         'ml_strategy': {
-            'name': f"{args.model}_{args.horizon}d_top{args.top_k}",
+            'name': strategy_name,
             'equity_curve': equity_curve,
             'metrics': metrics
         }
@@ -1486,9 +1786,9 @@ def main():
         # Run all benchmarks
         benchmark_results = benchmarks.run_benchmarks(prices_df, benchmark_symbols)
         
-        for symbol, equity_curve in benchmark_results.items():
+        for symbol, benchmark_equity_curve in benchmark_results.items():
             try:
-                metrics = PerformanceMetrics.compute_metrics(equity_curve)
+                benchmark_metrics = PerformanceMetrics.compute_metrics(benchmark_equity_curve)
                 display_name = benchmark_definitions.get(
                     next((k for k, v in benchmark_definitions.items() if v['ticker'] == symbol), None),
                     {}
@@ -1497,8 +1797,8 @@ def main():
                 result_key = f"{symbol.lower()}_buy_and_hold"
                 all_results[result_key] = {
                     'name': f'{display_name} ({symbol}) Buy and Hold',
-                    'equity_curve': equity_curve,
-                    'metrics': metrics
+                    'equity_curve': benchmark_equity_curve,
+                    'metrics': benchmark_metrics
                 }
                 logger.info(f"{symbol} buy-and-hold benchmark complete")
             except Exception as e:
@@ -1558,8 +1858,9 @@ def main():
                 }
                 
                 # Check if ML strategy is above 3-sigma
-                ml_sharpe = metrics['sharpe_ratio']
-                ml_cagr = metrics['cagr']
+                ml_metrics = all_results['ml_strategy']['metrics']
+                ml_sharpe = ml_metrics['sharpe_ratio']
+                ml_cagr = ml_metrics['cagr']
                 sharpe_3sigma_high = all_results['random_portfolios']['distribution']['sharpe_3sigma_high']
                 cagr_3sigma_high = all_results['random_portfolios']['distribution']['cagr_3sigma_high']
                 
@@ -1567,6 +1868,9 @@ def main():
                           f"CAGR mean={np.mean(random_cagrs):.2%}±{np.std(random_cagrs):.2%}")
                 logger.info(f"ML strategy Sharpe={ml_sharpe:.3f} (3σ={sharpe_3sigma_high:.3f}), "
                           f"CAGR={ml_cagr:.2%} (3σ={cagr_3sigma_high:.2%})")
+    
+    # Get ML strategy metrics (don't use the overwritten metrics variable)
+    ml_metrics = all_results['ml_strategy']['metrics']
     
     # Print results
     print("\n" + "="*80)
@@ -1580,15 +1884,15 @@ def main():
     print("\n" + "-"*80)
     print("ML STRATEGY PERFORMANCE:")
     print("-"*80)
-    print(f"  Total Return: {metrics['total_return']:.2%}")
-    print(f"  CAGR: {metrics['cagr']:.2%}")
-    print(f"  Annualized Volatility: {metrics['annualized_volatility']:.2%}")
-    print(f"  Sharpe Ratio: {metrics['sharpe_ratio']:.3f}")
-    print(f"  Max Drawdown: {metrics['max_drawdown']:.2%}")
-    print(f"  Calmar Ratio: {metrics['calmar_ratio']:.3f}")
-    print(f"  Hit Rate: {metrics['hit_rate']:.2%}")
-    print(f"  VaR (5%): {metrics['var_5pct']:.4f}")
-    print(f"  CVaR (5%): {metrics['cvar_5pct']:.4f}")
+    print(f"  Total Return: {ml_metrics['total_return']:.2%}")
+    print(f"  CAGR: {ml_metrics['cagr']:.2%}")
+    print(f"  Annualized Volatility: {ml_metrics['annualized_volatility']:.2%}")
+    print(f"  Sharpe Ratio: {ml_metrics['sharpe_ratio']:.3f}")
+    print(f"  Max Drawdown: {ml_metrics['max_drawdown']:.2%}")
+    print(f"  Calmar Ratio: {ml_metrics['calmar_ratio']:.3f}")
+    print(f"  Hit Rate: {ml_metrics['hit_rate']:.2%}")
+    print(f"  VaR (5%): {ml_metrics['var_5pct']:.4f}")
+    print(f"  CVaR (5%): {ml_metrics['cvar_5pct']:.4f}")
     
     # Print benchmark comparisons
     if args.run_benchmarks:
@@ -1600,10 +1904,10 @@ def main():
         comparison_data = []
         comparison_data.append({
             'Strategy': all_results['ml_strategy']['name'],
-            'CAGR': metrics['cagr'],
-            'Sharpe': metrics['sharpe_ratio'],
-            'Max DD': metrics['max_drawdown'],
-            'Calmar': metrics['calmar_ratio']
+            'CAGR': ml_metrics['cagr'],
+            'Sharpe': ml_metrics['sharpe_ratio'],
+            'Max DD': ml_metrics['max_drawdown'],
+            'Calmar': ml_metrics['calmar_ratio']
         })
         
         # Add all benchmark results (buy-and-hold benchmarks)
@@ -1722,6 +2026,18 @@ def main():
             config.retraining.time_decay.lambda_ = args.time_decay_lambda
             logger.info(f"Overriding time-decay lambda to {args.time_decay_lambda}")
         
+        # Determine horizons for policy-driven backtest
+        policy_horizons = None
+        policy_multi_horizon = False
+        policy_multi_horizon_config = None
+        
+        if args.multi_horizon:
+            policy_multi_horizon = True
+            policy_horizons = horizons
+            policy_multi_horizon_config = multi_horizon_config
+        else:
+            policy_horizons = [args.horizon]
+        
         policy_results = run_policy_driven_backtest(
             storage=storage,
             api=api,
@@ -1730,6 +2046,9 @@ def main():
             end_date=end_date,
             model_type=args.model,
             horizon=args.horizon,
+            horizons=policy_horizons,
+            multi_horizon=policy_multi_horizon,
+            multi_horizon_config=policy_multi_horizon_config,
             top_k=args.top_k,
             initial_capital=args.initial_capital,
             config=config

@@ -268,14 +268,92 @@ class LiveEngine:
         Run model inference.
         
         Supports:
-        - Dict of sklearn/xgboost models (one per horizon)
-        - Single sklearn/xgboost model
+        - Dict of sklearn/xgboost models (one per horizon) - multi-horizon tabular
+        - Single sklearn/xgboost model - single-horizon tabular
         - EnsembleXGBoostModel with predict_with_uncertainty
-        - PyTorch models with predict_mc
+        - PyTorch sequence models (ConvLSTM, TCN) with predict_mc - multi-horizon sequence
         
         Returns:
             Dict mapping horizon -> (predictions, uncertainties)
         """
+        # Check if this is a sequence model (PyTorch)
+        try:
+            import torch
+            if isinstance(self.model, torch.nn.Module):
+                # Sequence model - need to build sequences
+                sequence_length = self.config.get('sequence_length', 60)
+                trading_date = features_df['date'].iloc[0] if 'date' in features_df.columns else None
+                universe = set(features_df['asset_id'].unique()) if 'asset_id' in features_df.columns else None
+                
+                if trading_date is None or universe is None:
+                    logger.warning("Cannot build sequences without date and universe")
+                    return {}
+                
+                # Build sequence ending at trading_date
+                sequence_array = self.feature_pipeline.build_features_sequence(
+                    as_of_date=trading_date,
+                    sequence_length=sequence_length,
+                    universe=universe
+                )
+                
+                if sequence_array.size == 0:
+                    logger.warning("No sequences built")
+                    return {}
+                
+                # Convert to tensor
+                sequence_tensor = torch.FloatTensor(sequence_array)
+                device = next(self.model.parameters()).device
+                sequence_tensor = sequence_tensor.to(device)
+                
+                # Predict with uncertainty if model supports it
+                if hasattr(self.model, 'predict_mc'):
+                    predictions = self.model.predict_mc(sequence_tensor, n_samples=50)
+                else:
+                    # Single forward pass
+                    self.model.eval()
+                    with torch.no_grad():
+                        outputs = self.model(sequence_tensor)
+                        predictions = {}
+                        for horizon, pred in outputs.items():
+                            if isinstance(pred, tuple):
+                                # Mean-variance output
+                                mean = pred[0].cpu().numpy()
+                                logvar = pred[1].cpu().numpy()
+                                std = np.sqrt(np.exp(logvar))
+                                predictions[horizon] = (mean, std)
+                            else:
+                                # Single output - use heuristic uncertainty
+                                mean = pred.cpu().numpy()
+                                std = np.abs(mean) * 0.1 + 0.05
+                                predictions[horizon] = (mean, std)
+                
+                # Map predictions back to asset_ids in features_df
+                # sequence_array shape: (num_assets, seq_len, features)
+                # features_df has asset_ids - need to align
+                if 'asset_id' in features_df.columns:
+                    asset_ids = features_df['asset_id'].values
+                    # Get asset_ids from sequence (from build_features_sequence)
+                    # The sequence order should match the universe order
+                    aligned_predictions = {}
+                    for horizon in predictions:
+                        mu, sigma = predictions[horizon]
+                        # If lengths match, use as-is; otherwise need to map
+                        if len(mu) == len(asset_ids):
+                            aligned_predictions[horizon] = (mu, sigma)
+                        else:
+                            # Mismatch - try to align by asset_id
+                            # For now, use first N or pad
+                            n = min(len(mu), len(asset_ids))
+                            aligned_predictions[horizon] = (mu[:n], sigma[:n])
+                    predictions = aligned_predictions
+                
+                return predictions
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"Error in sequence model prediction: {e}")
+        
+        # Tabular model path
         # Extract feature columns (exclude asset_id, date)
         feature_cols = [c for c in features_df.columns if c not in ['asset_id', 'date']]
         X = features_df[feature_cols].copy()
@@ -287,14 +365,14 @@ class LiveEngine:
         
         # Check model type
         if isinstance(self.model, dict):
-            # Dict of models (one per horizon)
+            # Dict of models (one per horizon) - multi-horizon tabular
             predictions = {}
             for horizon, model in self.model.items():
                 pred, sigma = self._predict_single_model(model, X)
                 predictions[horizon] = (pred, sigma)
             return predictions
         else:
-            # Single model
+            # Single model - single-horizon tabular
             pred, sigma = self._predict_single_model(self.model, X)
             # Get horizon from config or default to 20
             horizon = self.config.get('horizon', 20)
