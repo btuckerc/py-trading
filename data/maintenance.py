@@ -315,9 +315,12 @@ class DataMaintenanceManager:
         storage: StorageBackend,
         config: Optional[Dict[str, Any]] = None
     ):
+        from data.universe import TradingCalendar
+        
         self.storage = storage
         self.config = config or {}
         self.checker = DataCoverageChecker(storage)
+        self.calendar = TradingCalendar()  # For trading day checks
         
         # Extract config values with defaults
         # Handle both dict and Pydantic model configs
