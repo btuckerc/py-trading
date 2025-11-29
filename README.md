@@ -236,6 +236,26 @@ python scripts/run_multi_horizon_backtest.py \
 
 Generate professional performance reports with charts:
 
+### Quick Recent Reports (Week/MTD/YTD)
+
+Run leakage-safe reports for recent periods (shortest to longest):
+
+```bash
+# Run all three reports (week, month-to-date, year-to-date) with HTML output
+docker-compose run --rm trading python scripts/run_recent_reports.py --html
+
+# Run without charts (faster, text/JSON only)
+docker-compose run --rm trading python scripts/run_recent_reports.py --no-charts
+
+# Run with specific initial capital ($10k and $100k variants)
+docker-compose run --rm trading python scripts/run_recent_reports.py --capital-variants --html
+
+# Run only specific periods
+docker-compose run --rm trading python scripts/run_recent_reports.py --periods week mtd --html
+```
+
+### Custom Date Ranges
+
 ```bash
 # Simulate daily trading and generate report
 python scripts/simulate_daily_trading.py --start-date 2025-09-01 --end-date 2025-11-26

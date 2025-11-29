@@ -744,11 +744,15 @@ def generate_text_summary(results: dict, metrics: dict) -> str:
     benchmark_display_names = metrics.get("benchmark_display_names", {})
     
     # Backward compatibility: use spy_return_pct if benchmark_returns_pct not available
-    if not benchmark_returns_pct and 'spy_return_pct' in summary:
+    # Only create fallback if spy_return_pct is not None
+    if not benchmark_returns_pct and 'spy_return_pct' in summary and summary['spy_return_pct'] is not None:
         benchmark_returns_pct = {'SPY': summary['spy_return_pct']}
         benchmark_display_names = {'SPY': 'S&P 500'}
     
-    # Build header with benchmark columns
+    # Filter out None values from benchmark_returns_pct
+    benchmark_returns_pct = {k: v for k, v in benchmark_returns_pct.items() if v is not None}
+    
+    # Build header with benchmark columns (only include benchmarks with valid data)
     header_cols = ['Metric', 'ML Strategy']
     for ticker in ['SPY', 'DIA', 'QQQ']:
         if ticker in benchmark_returns_pct:
@@ -766,7 +770,11 @@ def generate_text_summary(results: dict, metrics: dict) -> str:
     return_line = f"{'Total Return':<30} {summary['total_return_pct']:>+14.2f}%"
     for ticker in ['SPY', 'DIA', 'QQQ']:
         if ticker in benchmark_returns_pct:
-            return_line += f" {benchmark_returns_pct[ticker]:>+14.2f}%"
+            bench_return = benchmark_returns_pct[ticker]
+            if bench_return is not None:
+                return_line += f" {bench_return:>+14.2f}%"
+            else:
+                return_line += f" {'N/A':>15}"
     lines.append(return_line)
     
     # Alpha row (vs primary benchmark)
@@ -774,8 +782,12 @@ def generate_text_summary(results: dict, metrics: dict) -> str:
         alpha_line = f"{'Alpha (vs Primary)':<30} {summary['alpha_pct']:>+14.2f}%"
         for ticker in ['SPY', 'DIA', 'QQQ']:
             if ticker in benchmark_returns_pct:
-                alpha_vs_bench = (summary['total_return_pct'] - benchmark_returns_pct[ticker])
-                alpha_line += f" {alpha_vs_bench:>+14.2f}%"
+                bench_return = benchmark_returns_pct[ticker]
+                if bench_return is not None:
+                    alpha_vs_bench = (summary['total_return_pct'] - bench_return)
+                    alpha_line += f" {alpha_vs_bench:>+14.2f}%"
+                else:
+                    alpha_line += f" {'N/A':>15}"
         lines.append(alpha_line)
     
     lines.append(f"{'Annualized Volatility':<30} {summary['annualized_volatility_pct']:>14.2f}%")
