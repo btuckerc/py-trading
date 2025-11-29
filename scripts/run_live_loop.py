@@ -530,13 +530,16 @@ def main():
     exposure_scale = 1.0
     regime_builder = RegimeFeatureBuilder(api)
     
-    # Get current regime if regime-aware mode enabled
+    # Always try to get current regime for display/logging (even if not using regime-aware features)
+    try:
+        regime_id, regime_descriptor = regime_builder.get_current_regime(trading_date)
+        logger.info(f"Current market regime: {regime_descriptor}")
+    except Exception as e:
+        logger.debug(f"Could not determine regime: {e}")
+    
+    # Use regime model if specified and regime-aware mode enabled
     if args.regime_aware or args.sector_tilts or args.vol_scaling:
         try:
-            # Try to get regime from database
-            regime_id, regime_descriptor = regime_builder.get_current_regime(trading_date)
-            logger.info(f"Current market regime: {regime_descriptor}")
-            
             # Load regime model if path specified
             if args.regime_model_path and Path(args.regime_model_path).exists():
                 regime_generator = RegimeLabelGenerator(storage)
@@ -544,8 +547,9 @@ def main():
                 regime_id, regime_descriptor = regime_generator.predict_regime(trading_date)
                 logger.info(f"Regime from model: {regime_descriptor}")
         except Exception as e:
-            logger.warning(f"Could not determine regime: {e}, using default")
-            regime_descriptor = "bear_low_vol"  # Conservative default
+            logger.warning(f"Could not determine regime from model: {e}, using database regime")
+            if regime_descriptor == "unknown":
+                regime_descriptor = "bear_low_vol"  # Conservative default
     
     # Initialize exposure manager
     exposure_manager = None
@@ -698,8 +702,9 @@ def main():
     )
     
     # Run the daily loop (this handles features, predictions, position-aware rebalancing, orders, and logging)
+    loop_results = None
     try:
-        engine.run_daily_loop(
+        loop_results = engine.run_daily_loop(
             trading_date, 
             dry_run=args.dry_run, 
             universe=universe,
@@ -722,6 +727,18 @@ def main():
     if heartbeat_path:
         write_heartbeat(heartbeat_path, "completed")
     
+    # Extract results from engine (or use defaults if loop didn't complete)
+    if loop_results:
+        result_regime = loop_results.get('regime', regime_descriptor)
+        result_exposure = loop_results.get('exposure_scale', exposure_scale)
+        result_orders = loop_results.get('orders_count', 0)
+        result_targets = len(loop_results.get('target_positions', {}))
+    else:
+        result_regime = regime_descriptor
+        result_exposure = exposure_scale
+        result_orders = 0
+        result_targets = 0
+    
     # Print summary
     print("\n" + "="*60)
     print("DAILY TRADING SUMMARY")
@@ -729,12 +746,17 @@ def main():
     print(f"Date: {trading_date}")
     print(f"Mode: {'DRY RUN' if args.dry_run else 'LIVE'}")
     print(f"Model: {args.model_type} ({args.horizon}d horizon)")
-    print(f"Regime: {regime_descriptor}")
-    print(f"Exposure Scale: {exposure_scale:.0%}")
+    print(f"Regime: {result_regime}")
+    print(f"Exposure Scale: {result_exposure:.0%}")
     print(f"Account Value: ${broker.get_account_value():,.2f}")
     print(f"Cash: ${broker.get_cash():,.2f}")
     print(f"Buying Power: ${broker.get_buying_power():,.2f}")
-    print(f"Positions: {len(broker.get_positions())}")
+    if args.dry_run:
+        print(f"Target Positions: {result_targets}")
+        print(f"Orders (would submit): {result_orders}")
+    else:
+        print(f"Positions: {len(broker.get_positions())}")
+        print(f"Orders Submitted: {result_orders}")
     
     if args.regime_aware:
         print(f"\nRegime-Aware Features:")

@@ -2,7 +2,7 @@
 
 import pandas as pd
 import numpy as np
-from typing import Optional, Dict, List, Tuple, Set
+from typing import Optional, Dict, List, Tuple, Set, Any
 from datetime import date, datetime, time
 from pathlib import Path
 import json
@@ -78,7 +78,7 @@ class LiveEngine:
         dry_run: bool = False, 
         universe: Optional[Set[int]] = None,
         skip_preflight: bool = False
-    ):
+    ) -> Optional[Dict[str, Any]]:
         """
         Run daily trading loop.
         
@@ -89,13 +89,17 @@ class LiveEngine:
             dry_run: If True, don't submit orders (for testing)
             universe: Optional pre-computed universe. If None, will fetch from API.
             skip_preflight: If True, skip pre-flight checks (for --force mode)
+            
+        Returns:
+            Dict with results including regime, exposure_scale, orders, target_positions
+            or None if preflight checks failed
         """
         logger.info(f"Running daily loop for {trading_date}")
         
         # Pre-flight checks (can be skipped in force mode)
         if not skip_preflight and not self._run_preflight_checks(trading_date):
             logger.error("Pre-flight checks failed, aborting")
-            return
+            return None
         
         # 1. Get latest data
         if universe is None:
@@ -116,7 +120,7 @@ class LiveEngine:
         
         if len(features_df) == 0:
             logger.warning("No features generated")
-            return
+            return None
         
         # 4. Run model inference
         predictions = self._predict(features_df)
@@ -157,6 +161,17 @@ class LiveEngine:
             current_positions=current_positions,
             regime_descriptor=regime_descriptor, exposure_scale=exposure_scale
         )
+        
+        # 10. Return results for caller
+        return {
+            'trading_date': trading_date,
+            'regime': regime_descriptor,
+            'exposure_scale': exposure_scale,
+            'target_positions': target_weights,
+            'orders': orders,
+            'orders_count': len(orders),
+            'dry_run': dry_run
+        }
     
     def _run_preflight_checks(self, trading_date: date) -> bool:
         """
